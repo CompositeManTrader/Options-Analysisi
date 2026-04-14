@@ -289,7 +289,8 @@ def exchange_code(app_key, app_secret, code, callback_url):
                  "Content-Type": "application/x-www-form-urlencoded"},
         data={"grant_type": "authorization_code", "code": code,
               "redirect_uri": callback_url}, timeout=15)
-    r.raise_for_status()
+    if not r.ok:
+        raise ValueError(f"HTTP {r.status_code} — {r.text}")
     return r.json()
 
 
@@ -486,14 +487,57 @@ def show_connect_screen():
 
 def _finish_oauth(redirect_url):
     try:
-        code = parse_qs(urlparse(redirect_url).query).get("code", [None])[0]
-        if not code:
-            st.error("No se encontró ?code= en la URL. Copia la URL completa de la barra de direcciones.")
-            return
-        with st.spinner("Intercambiando código…"):
-            tok = exchange_code(st.session_state["app_key"], st.session_state["app_secret"],
-                                code, st.session_state["callback_url"])
+        parsed   = urlparse(redirect_url.strip())
+        params   = parse_qs(parsed.query)
+        code     = params.get("code", [None])[0]
+        callback = st.session_state.get("callback_url", "https://127.0.0.1")
 
+        if not code:
+            st.error("No se encontró `?code=` en la URL. Copia la URL completa de la barra de direcciones.")
+            return
+
+        with st.spinner("Intercambiando código…"):
+            creds = base64.b64encode(
+                f"{st.session_state['app_key']}:{st.session_state['app_secret']}".encode()
+            ).decode()
+            r = requests.post(
+                _TOKEN_URL,
+                headers={"Authorization": f"Basic {creds}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"grant_type": "authorization_code",
+                      "code": code,
+                      "redirect_uri": callback},
+                timeout=15,
+            )
+
+        if not r.ok:
+            body = r.text
+            st.error(f"❌ Schwab respondió HTTP {r.status_code}: `{body}`")
+
+            if "invalid_grant" in body or "Authorization code" in body:
+                st.warning(
+                    "**Código expirado o ya usado.** "
+                    "Los códigos de autorización de Schwab duran solo ~30 segundos. "
+                    "Haz clic en **AUTORIZAR EN SCHWAB** de nuevo y pega la URL "
+                    "en la app **de inmediato**, sin demora."
+                )
+            elif "redirect_uri" in body.lower():
+                st.warning(
+                    f"**Mismatch de Callback URL.**  \n"
+                    f"La URL que se envió: `{callback}`  \n"
+                    "Debe ser **exactamente igual** a la registrada en tu app de Schwab "
+                    "(sin barra final, mismo protocolo https, mismo dominio).  \n"
+                    "Verifica en [developer.schwab.com](https://developer.schwab.com) → tu app → Callback URL."
+                )
+            elif "invalid_client" in body or r.status_code == 401:
+                st.warning(
+                    "**App Key o App Secret incorrectos.** "
+                    "Verifica que coincidan exactamente con los de "
+                    "[developer.schwab.com](https://developer.schwab.com)."
+                )
+            return
+
+        tok = r.json()
         refresh_token = tok["refresh_token"]
         st.session_state["tokens"] = {
             "access_token":  tok["access_token"],
@@ -504,7 +548,6 @@ def _finish_oauth(redirect_url):
         st.session_state["connected"]     = True
         st.session_state["oauth_pending"] = False
 
-        # ── Show refresh token so user can save it to Secrets ──────────────
         st.success("✅ Autenticado correctamente.")
         st.markdown("""
         <div style="background:#0e0e1a;border:1px solid #f97316;border-radius:6px;padding:1rem 1.2rem;margin-top:1rem;">
@@ -515,13 +558,14 @@ def _finish_oauth(redirect_url):
         st.code(f'REFRESH_TOKEN = "{refresh_token}"', language="toml")
         st.markdown("""
         <p style="color:#606080;font-family:JetBrains Mono,monospace;font-size:0.7rem;margin:0.5rem 0 0;">
-        En Streamlit Cloud: <b>Manage App → Settings → Secrets</b> → agrega la línea de arriba.
+        Streamlit Cloud → <b>Manage App → Settings → Secrets</b> → agrega la línea de arriba → Save.
         </p></div>
         """, unsafe_allow_html=True)
-        st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True,
-                  on_click=lambda: st.rerun())
+        if st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True):
+            st.rerun()
+
     except Exception as e:
-        st.error(f"Error al obtener tokens: {e}")
+        st.error(f"❌ Error inesperado: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
