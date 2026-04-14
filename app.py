@@ -1139,7 +1139,14 @@ def show_dashboard():
     vol_u = int(ul.get("totalVolume", 0) or 0)
 
     # ── Analytics ────────────────────────────────────────────────────────────
-    dte_v  = int(calls["DTE"].dropna().values[0]) if not calls.empty and "DTE" in calls.columns and len(calls["DTE"].dropna()) > 0 else 0
+    dte_v = 0
+    if not calls.empty and "DTE" in calls.columns:
+        _dte_vals = calls["DTE"].dropna()
+        if len(_dte_vals) > 0:
+            try:
+                dte_v = int(float(str(_dte_vals.values[0]).split(".")[0]))
+            except Exception:
+                dte_v = 0
     iv_atm = calc_atm_iv(calls, spot)
     p_c    = calc_pcr(calls, puts)
     mp     = calc_max_pain(calls, puts)
@@ -1289,67 +1296,83 @@ def show_dashboard():
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    # ── Auto-capture OAuth code from URL query params ─────────────────────
-    # When CALLBACK_URL = Streamlit app URL, Schwab redirects back here
-    # with ?code=xxx automatically. Capture it before anything else.
-    qp = st.query_params
-    if "code" in qp and not st.session_state.get("connected"):
-        code     = qp["code"]
-        callback = (
-            st.session_state.get("callback_url")
-            or _secret("CALLBACK_URL", "https://127.0.0.1")
-        )
-        app_key    = st.session_state.get("app_key") or _secret("APP_KEY")
-        app_secret = st.session_state.get("app_secret") or _secret("APP_SECRET")
+    # ── 1. Capture OAuth code from URL IMMEDIATELY and clear it ──────────
+    # Streamlit reruns the script on every interaction. If we don't clear
+    # the URL right away, the app tries to re-exchange an already-used/expired code.
+    if "code" in st.query_params:
+        if not st.session_state.get("connected") and "oauth_code" not in st.session_state:
+            st.session_state["oauth_code"] = st.query_params["code"]
+        st.query_params.clear()   # always clear — even on reloads
+        st.rerun()                # rerun with clean URL before doing anything else
+        return
 
-        if app_key and app_secret:
-            st.markdown(CSS, unsafe_allow_html=True)
-            st.markdown("<br><br>", unsafe_allow_html=True)
-            _, col, _ = st.columns([1, 1.2, 1])
-            with col:
-                with st.spinner("Autenticando con Schwab…"):
-                    try:
-                        creds = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
-                        r = requests.post(
-                            _TOKEN_URL,
-                            headers={"Authorization": f"Basic {creds}",
-                                     "Content-Type": "application/x-www-form-urlencoded"},
-                            data={"grant_type": "authorization_code",
-                                  "code": code,
-                                  "redirect_uri": callback},
-                            timeout=15,
-                        )
-                        if r.ok:
-                            tok = r.json()
-                            st.session_state["app_key"]    = app_key
-                            st.session_state["app_secret"] = app_secret
-                            st.session_state["callback_url"] = callback
-                            st.session_state["tokens"] = {
-                                "access_token":  tok["access_token"],
-                                "refresh_token": tok["refresh_token"],
-                                "expiry": datetime.datetime.utcnow() + datetime.timedelta(
-                                    seconds=tok.get("expires_in", 1800)),
-                            }
-                            st.session_state["connected"] = True
-                            # Clear code from URL so it doesn't re-trigger
-                            st.query_params.clear()
+    # ── 2. Process captured code (runs on the clean-URL rerun) ───────────
+    if "oauth_code" in st.session_state and not st.session_state.get("connected"):
+        code     = st.session_state.pop("oauth_code")   # consume once, no retries
+        callback = st.session_state.get("callback_url") or _secret("CALLBACK_URL", "https://127.0.0.1")
+        app_key  = st.session_state.get("app_key")      or _secret("APP_KEY")
+        app_sec  = st.session_state.get("app_secret")   or _secret("APP_SECRET")
 
-                            st.success("✅ Autenticado. Guarda este Refresh Token en Secrets:")
-                            st.code(f'REFRESH_TOKEN = "{tok["refresh_token"]}"', language="toml")
-                            st.caption("Streamlit Cloud → Manage App → Settings → Secrets → pega la línea → Save")
-                            if st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True):
-                                st.rerun()
-                            return
-                        else:
-                            st.error(f"Error {r.status_code}: {r.text}")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            return
+        st.markdown(CSS, unsafe_allow_html=True)
+        _, col, _ = st.columns([1, 1.2, 1])
+        with col:
+            if not app_key or not app_sec:
+                st.error("No se encontraron APP_KEY / APP_SECRET en Secrets ni en sesión.")
+                return
 
-    # ── Normal flow ───────────────────────────────────────────────────────
+            with st.spinner("Autenticando con Schwab…"):
+                creds = base64.b64encode(f"{app_key}:{app_sec}".encode()).decode()
+                r = requests.post(
+                    _TOKEN_URL,
+                    headers={"Authorization": f"Basic {creds}",
+                             "Content-Type": "application/x-www-form-urlencoded"},
+                    data={"grant_type": "authorization_code",
+                          "code": code,
+                          "redirect_uri": callback},
+                    timeout=15,
+                )
+
+            if r.ok:
+                tok = r.json()
+                st.session_state.update({
+                    "app_key": app_key, "app_secret": app_sec,
+                    "callback_url": callback, "connected": True,
+                    "tokens": {
+                        "access_token":  tok["access_token"],
+                        "refresh_token": tok["refresh_token"],
+                        "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                            seconds=tok.get("expires_in", 1800)),
+                    },
+                })
+                st.success("✅ Conectado correctamente.")
+                st.markdown(
+                    '<p style="color:#f97316;font-family:JetBrains Mono,monospace;'
+                    'font-size:0.8rem;font-weight:700;margin:1rem 0 0.4rem;">'
+                    '⭐ Guarda este Refresh Token en Secrets para no volver a autenticarte:</p>',
+                    unsafe_allow_html=True,
+                )
+                st.code(f'REFRESH_TOKEN = "{tok["refresh_token"]}"', language="toml")
+                st.caption("Streamlit Cloud → Manage App → Settings → Secrets → pega la línea → Save")
+                if st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True):
+                    st.rerun()
+            else:
+                body = r.text
+                st.error(f"Error {r.status_code}: `{body}`")
+                if "expired" in body or "invalid_grant" in body:
+                    st.warning(
+                        "El código de autorización expiró. "
+                        "Vuelve a la pantalla anterior y haz clic en **AUTORIZAR EN SCHWAB** de nuevo. "
+                        "Al volver a la app el código se captura automáticamente, sin copiar ni pegar."
+                    )
+                if st.button("← VOLVER", use_container_width=True):
+                    st.rerun()
+        return
+
+    # ── 3. Auto-connect via Secrets (silent, no UI) ───────────────────────
     if not st.session_state.get("connected"):
         try_auto_connect()
 
+    # ── 4. Dashboard or connect screen ───────────────────────────────────
     if st.session_state.get("connected"):
         show_dashboard()
     else:
