@@ -610,6 +610,35 @@ def fetch_quote(symbol):
     return {}
 
 
+def fetch_price_history(symbol: str, period: int = 1, period_type: str = "year") -> pd.DataFrame:
+    """
+    Fetch daily OHLCV price history from Schwab.
+    Returns DataFrame with columns: date, open, high, low, close, volume.
+    Returns empty DataFrame on failure.
+    """
+    try:
+        r = api_get("/marketdata/v1/pricehistory", params={
+            "symbol":        symbol,
+            "periodType":    period_type,
+            "period":        period,
+            "frequencyType": "daily",
+            "frequency":     1,
+        })
+        if r.status_code != 200:
+            return pd.DataFrame()
+        data = r.json()
+        candles = data.get("candles", [])
+        if not candles:
+            return pd.DataFrame()
+        df = pd.DataFrame(candles)
+        df["date"] = pd.to_datetime(df["datetime"], unit="ms")
+        df = df[["date","open","high","low","close","volume"]].copy()
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def parse_chain(data):
     rows_c, rows_p = [], []
     for rows, key in [(rows_c, "callExpDateMap"), (rows_p, "putExpDateMap")]:
@@ -873,6 +902,145 @@ def calc_charm(c, p, dte):
         if "Theta" in df.columns and "Delta" in df.columns and dte > 0:
             df["Charm"] = (-df["Theta"] / (365 * abs(df["Delta"]) + 1e-9) ).round(4)
     return c, p
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VOLATILITY ANALYTICS — HV, IV Rank, Cone, Regime
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_hv(closes: pd.Series, window: int) -> pd.Series:
+    """Annualized historical volatility (close-to-close) as percentage."""
+    lr = np.log(closes / closes.shift(1))
+    return (lr.rolling(window).std() * np.sqrt(252) * 100).round(2)
+
+
+def calc_vol_analytics(price_df: pd.DataFrame, atm_iv: float) -> dict:
+    """
+    Full volatility analysis from price history + current ATM IV.
+    Returns a dict with all metrics and series needed for charts.
+    """
+    if price_df.empty or "close" not in price_df.columns or atm_iv is None:
+        return {}
+
+    closes = price_df["close"].dropna()
+    if len(closes) < 30:
+        return {}
+
+    log_rets = np.log(closes / closes.shift(1)).dropna()
+
+    # Rolling HV series
+    hv20_s = calc_hv(closes, 20).dropna()
+    hv30_s = calc_hv(closes, 30).dropna()
+    hv60_s = calc_hv(closes, 60).dropna()
+    hv90_s = calc_hv(closes, 90).dropna()
+
+    # Current values (safe extraction)
+    def _last(s):
+        return round(float(np.asarray(s.iloc[-1]).flat[0]), 2) if len(s) > 0 else None
+
+    hv20 = _last(hv20_s)
+    hv30 = _last(hv30_s)
+    hv60 = _last(hv60_s)
+    hv90 = _last(hv90_s)
+
+    # IV/HV ratio and spread
+    iv_hv_ratio  = round(atm_iv / (hv30 + 1e-9), 2) if hv30 else None
+    iv_hv_spread = round(atm_iv - hv30, 2)           if hv30 else None
+
+    # HV Percentile: where does current HV30 rank in its 1-year history?
+    hv_pct = None
+    if len(hv30_s) >= 20:
+        hv_pct = round(float((hv30_s < hv30).mean() * 100), 1)
+
+    # IV Rank proxy: (IV - HV_min) / (HV_max - HV_min) × 100
+    iv_rank = None
+    if len(hv30_s) >= 20:
+        hv_min = float(hv30_s.min())
+        hv_max = float(hv30_s.max())
+        if hv_max > hv_min:
+            iv_rank = round(max(0.0, min(100.0, (atm_iv - hv_min) / (hv_max - hv_min) * 100)), 1)
+
+    # Volatility Cone: percentile distribution of HV at multiple windows
+    cone = {}
+    for w, lbl in [(10,"HV10"),(20,"HV20"),(30,"HV30"),(60,"HV60"),(90,"HV90")]:
+        s = calc_hv(closes, w).dropna()
+        if len(s) >= w:
+            cone[lbl] = {
+                "p10":     round(float(s.quantile(0.10)), 2),
+                "p25":     round(float(s.quantile(0.25)), 2),
+                "p50":     round(float(s.quantile(0.50)), 2),
+                "p75":     round(float(s.quantile(0.75)), 2),
+                "p90":     round(float(s.quantile(0.90)), 2),
+                "current": round(float(s.iloc[-1]), 2),
+            }
+
+    # Vol regime classification
+    if iv_hv_ratio is not None:
+        if iv_hv_ratio > 1.3:
+            vol_regime = "IV CARA"
+        elif iv_hv_ratio < 0.8:
+            vol_regime = "IV BARATA"
+        else:
+            vol_regime = "IV NEUTRAL"
+    else:
+        vol_regime = "—"
+
+    # Returns distribution stats
+    ann_ret  = round(float(log_rets.mean() * 252 * 100), 2)
+    skewness = round(float(log_rets.skew()), 3)
+    kurt     = round(float(log_rets.kurt()), 3)
+
+    return {
+        "hv20": hv20, "hv30": hv30, "hv60": hv60, "hv90": hv90,
+        "iv_hv_ratio":  iv_hv_ratio,
+        "iv_hv_spread": iv_hv_spread,
+        "hv_percentile": hv_pct,
+        "iv_rank":       iv_rank,
+        "vol_regime":    vol_regime,
+        "cone":          cone,
+        "hv20_series":   hv20_s,
+        "hv30_series":   hv30_s,
+        "hv60_series":   hv60_s,
+        "log_returns":   log_rets,
+        "closes":        closes,
+        "ann_ret":       ann_ret,
+        "skewness":      skewness,
+        "kurtosis":      kurt,
+        "dates":         price_df["date"],
+    }
+
+
+def calc_dex_advanced(c_all: pd.DataFrame, p_all: pd.DataFrame, spot: float) -> dict:
+    """
+    Delta Exposure (DEX) — net directional bias of options positioning.
+    DEX(k) = OI(k) × Delta(k) × 100 × S
+    """
+    if c_all.empty or "Delta" not in c_all.columns:
+        return {}
+    c2 = c_all[["Strike","OI","Delta"]].copy()
+    p2 = p_all[["Strike","OI","Delta"]].copy() if not p_all.empty else pd.DataFrame()
+
+    c2["DEX"] = c2["OI"] * c2["Delta"].clip(0, 1) * 100 * spot
+    if not p2.empty:
+        p2["DEX"] = p2["OI"] * p2["Delta"].clip(-1, 0) * 100 * spot  # already negative
+
+    c_grp = c2.groupby("Strike")["DEX"].sum().reset_index().rename(columns={"DEX":"C_DEX"})
+    p_grp = p2.groupby("Strike")["DEX"].sum().reset_index().rename(columns={"DEX":"P_DEX"}) \
+            if not p2.empty else pd.DataFrame(columns=["Strike","P_DEX"])
+
+    dex = c_grp.merge(p_grp, on="Strike", how="outer").fillna(0).sort_values("Strike")
+    dex["Net_DEX"] = dex["C_DEX"] + dex["P_DEX"]
+
+    total_net = dex["Net_DEX"].sum()
+    bias = "CALL-HEAVY (alcista)" if total_net > 0 else ("PUT-HEAVY (bajista)" if total_net < 0 else "NEUTRAL")
+
+    return {
+        "df": dex,
+        "total_net_mn": round(total_net / 1e6, 1),
+        "total_call_mn": round(dex["C_DEX"].sum() / 1e6, 1),
+        "total_put_mn":  round(dex["P_DEX"].sum() / 1e6, 1),
+        "bias": bias,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1280,7 +1448,358 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     else: st.caption("Requiere columnas IV% y DTE en la cadena.")
 
 
-def chart_iv_skew(skew_df, spot):
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VOLATILITY CHARTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def chart_vol_cone(analytics: dict, atm_iv: float, symbol: str):
+    """
+    Volatility Cone: historical percentile bands of HV vs current HV and IV.
+    Shows whether options are cheap or expensive relative to realized vol.
+    """
+    cone = analytics.get("cone", {})
+    if not cone:
+        return None
+
+    windows = list(cone.keys())
+    p10  = [cone[w]["p10"]  for w in windows]
+    p25  = [cone[w]["p25"]  for w in windows]
+    p50  = [cone[w]["p50"]  for w in windows]
+    p75  = [cone[w]["p75"]  for w in windows]
+    p90  = [cone[w]["p90"]  for w in windows]
+    curr = [cone[w]["current"] for w in windows]
+
+    fig = go.Figure()
+
+    # P10-P90 band
+    fig.add_trace(go.Scatter(
+        x=windows + windows[::-1],
+        y=p90 + p10[::-1],
+        fill="toself", fillcolor="rgba(59,130,246,0.06)",
+        line=dict(color="rgba(0,0,0,0)"), showlegend=True, name="P10–P90",
+        hoverinfo="skip",
+    ))
+    # P25-P75 band
+    fig.add_trace(go.Scatter(
+        x=windows + windows[::-1],
+        y=p75 + p25[::-1],
+        fill="toself", fillcolor="rgba(59,130,246,0.14)",
+        line=dict(color="rgba(0,0,0,0)"), showlegend=True, name="P25–P75",
+        hoverinfo="skip",
+    ))
+    # Median
+    fig.add_trace(go.Scatter(
+        x=windows, y=p50, name="Mediana HV",
+        line=dict(color=_BLUE, width=1.5, dash="dot"),
+        hovertemplate="%{x}: Mediana %{y:.1f}%<extra></extra>",
+    ))
+    # Current HV
+    fig.add_trace(go.Scatter(
+        x=windows, y=curr, name="HV Actual",
+        line=dict(color=_ORANGE, width=2.5),
+        mode="lines+markers", marker=dict(size=6),
+        hovertemplate="%{x}: HV Actual %{y:.1f}%<extra></extra>",
+    ))
+    # ATM IV horizontal line
+    if atm_iv:
+        fig.add_hline(
+            y=atm_iv, line_dash="dash", line_color=_GREEN, line_width=1.5,
+            annotation_text=f"  ATM IV {atm_iv:.1f}%",
+            annotation_font_color=_GREEN, annotation_font_size=10,
+        )
+
+    fig.update_layout(
+        height=320,
+        xaxis_title="Ventana de lookback",
+        yaxis_title="Volatilidad (%)",
+        title=dict(text=f"  VOLATILITY CONE  ·  {symbol}  ·  Bandas históricas P10/P25/P75/P90",
+                   font=dict(size=11, color="#606080", family=_FONT_MONO), x=0),
+        **_BASE,
+    )
+    fig.update_xaxes(**_AX_NOZERO)
+    fig.update_yaxes(**_AX_NOZERO)
+    return fig
+
+
+def chart_iv_hv_history(analytics: dict, atm_iv: float):
+    """IV vs HV30 time series — shows historical relationship over 1 year."""
+    hv30_s = analytics.get("hv30_series")
+    dates  = analytics.get("dates")
+    if hv30_s is None or dates is None or len(hv30_s) < 10:
+        return None
+
+    # Align dates with HV series
+    hv30_s = hv30_s.dropna()
+    try:
+        hv_dates = dates.iloc[hv30_s.index].reset_index(drop=True)
+    except Exception:
+        hv_dates = pd.Series(range(len(hv30_s)))
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hv_dates, y=hv30_s.values,
+        name="HV30", line=dict(color=_ORANGE, width=2),
+        fill="tozeroy", fillcolor="rgba(249,115,22,0.06)",
+        hovertemplate="Fecha: %{x|%Y-%m-%d}<br>HV30: %{y:.1f}%<extra></extra>",
+    ))
+    if atm_iv:
+        fig.add_hline(
+            y=atm_iv, line_dash="dash", line_color=_GREEN, line_width=1.5,
+            annotation_text=f"  ATM IV {atm_iv:.1f}%",
+            annotation_font_color=_GREEN, annotation_font_size=10,
+        )
+
+    # Highlight current position
+    if len(hv30_s) > 0:
+        last_date = hv_dates.iloc[-1] if hasattr(hv_dates, "iloc") else hv_dates[len(hv_dates)-1]
+        last_hv   = float(hv30_s.iloc[-1])
+        fig.add_trace(go.Scatter(
+            x=[last_date], y=[last_hv],
+            mode="markers", marker=dict(size=9, color=_ORANGE, line=dict(width=2, color="#0b0b14")),
+            name="HV30 actual", showlegend=True,
+            hovertemplate=f"HV30 actual: {last_hv:.1f}%<extra></extra>",
+        ))
+
+    fig.update_layout(
+        height=260,
+        xaxis_title="Fecha",
+        yaxis_title="Volatilidad (%)",
+        **_BASE,
+    )
+    fig.update_xaxes(**_AX_NOZERO)
+    fig.update_yaxes(**_AX_NOZERO)
+    return fig
+
+
+def chart_returns_dist(analytics: dict, symbol: str):
+    """Daily returns histogram with normal distribution overlay."""
+    log_rets = analytics.get("log_returns")
+    if log_rets is None or len(log_rets) < 20:
+        return None
+
+    rets_pct = (log_rets * 100).dropna()
+    mu  = float(rets_pct.mean())
+    sig = float(rets_pct.std())
+
+    # Histogram
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=rets_pct, name="Retornos",
+        nbinsx=60,
+        marker_color="rgba(59,130,246,0.55)",
+        marker_line=dict(width=0),
+        histnorm="probability density",
+        hovertemplate="Retorno: %{x:.2f}%<br>Densidad: %{y:.4f}<extra></extra>",
+    ))
+
+    # Normal overlay
+    x_norm = np.linspace(rets_pct.min(), rets_pct.max(), 200)
+    y_norm = (1/(sig * np.sqrt(2*np.pi))) * np.exp(-0.5*((x_norm - mu)/sig)**2)
+    fig.add_trace(go.Scatter(
+        x=x_norm, y=y_norm, name="Normal",
+        line=dict(color=_ORANGE, width=2, dash="dot"),
+        hoverinfo="skip",
+    ))
+
+    # ±1σ, ±2σ lines
+    for n, clr, lbl in [(1, "rgba(34,197,94,0.5)", "±1σ"), (2, "rgba(244,63,94,0.4)", "±2σ")]:
+        for sign in [-1, 1]:
+            fig.add_vline(x=mu + sign*n*sig, line_dash="dot", line_color=clr, line_width=1,
+                          annotation_text=f" {lbl}" if sign > 0 else "",
+                          annotation_font_size=9, annotation_font_color=clr)
+    fig.add_vline(x=0, line_dash="dot", line_color="rgba(255,255,255,0.1)", line_width=1)
+
+    skew = analytics.get("skewness", 0)
+    kurt = analytics.get("kurtosis", 0)
+    fig.update_layout(
+        height=280,
+        xaxis_title="Retorno diario (%)",
+        yaxis_title="Densidad",
+        title=dict(
+            text=(f"  DISTRIBUCIÓN DE RETORNOS  ·  {symbol}  ·  "
+                  f"μ={mu:.2f}%  σ={sig:.2f}%  Asimetría={skew:.2f}  Curtosis={kurt:.2f}"),
+            font=dict(size=11, color="#606080", family=_FONT_MONO), x=0
+        ),
+        **_BASE,
+    )
+    fig.update_xaxes(**_AX_NOZERO)
+    fig.update_yaxes(**_AX_NOZERO)
+    return fig
+
+
+def chart_dex(dex_data: dict, spot: float):
+    """Proper Delta Exposure chart with call/put split and net bias."""
+    if not dex_data or dex_data.get("df") is None:
+        return None
+    df = dex_data["df"]
+    if df.empty:
+        return None
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        subplot_titles=["DELTA EXPOSURE POR STRIKE", "NET DEX ACUMULADO"],
+        vertical_spacing=0.18, row_heights=[0.65, 0.35],
+    )
+
+    # Bars
+    fig.add_trace(go.Bar(
+        x=df["Strike"], y=df["C_DEX"] / 1e6, name="Call DEX",
+        marker=dict(color="rgba(34,197,94,0.72)", line=dict(width=0)),
+        hovertemplate="Strike: %{x}<br>Call DEX: $%{y:.1f}M<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=df["Strike"], y=df["P_DEX"] / 1e6, name="Put DEX",
+        marker=dict(color="rgba(244,63,94,0.72)", line=dict(width=0)),
+        hovertemplate="Strike: %{x}<br>Put DEX: $%{y:.1f}M<extra></extra>",
+    ), row=1, col=1)
+    _vline(fig, spot, row=1, col=1)
+
+    # Cumulative net DEX
+    cum = df["Net_DEX"].cumsum() / 1e6
+    fig.add_trace(go.Scatter(
+        x=df["Strike"], y=cum,
+        name="Cum. Net DEX", line=dict(color=_PURPLE, width=2),
+        fill="tozeroy", fillcolor="rgba(168,85,247,0.07)",
+        hovertemplate="Strike: %{x}<br>Cum DEX: $%{y:.1f}M<extra></extra>",
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.08)", row=2, col=1)
+    _vline(fig, spot, row=2, col=1)
+
+    bias  = dex_data.get("bias", "")
+    net   = dex_data.get("total_net_mn", 0)
+    sign  = "+" if net >= 0 else ""
+    clr   = _GREEN if net >= 0 else _RED
+
+    fig.update_layout(
+        height=460, barmode="relative",
+        title=dict(
+            text=f"  DEX TOTAL: ${sign}{net:.0f}M  ·  {bias}",
+            font=dict(size=11, color=clr, family=_FONT_MONO), x=0,
+        ),
+        **_BASE,
+    )
+    fig.update_xaxes(**_AX_NOZERO, title_text="Strike")
+    fig.update_yaxes(**_AX_ZERO, title_text="DEX ($M)", row=1, col=1)
+    fig.update_yaxes(**_AX_ZERO, title_text="Cum DEX ($M)", row=2, col=1)
+    for ann in fig.layout.annotations:
+        ann.font.update(size=10, color="#606080", family=_FONT_MONO)
+    return fig
+
+
+def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.DataFrame):
+    """
+    Full volatility analysis module.
+    Requires 1 year of daily price history.
+    """
+    if price_df.empty:
+        st.caption("No se pudo cargar el historial de precios para el análisis de volatilidad.")
+        return
+
+    analytics = calc_vol_analytics(price_df, atm_iv)
+    if not analytics:
+        st.caption("Datos insuficientes para el análisis de volatilidad.")
+        return
+
+    hv20 = analytics.get("hv20")
+    hv30 = analytics.get("hv30")
+    hv60 = analytics.get("hv60")
+    hv90 = analytics.get("hv90")
+    ratio = analytics.get("iv_hv_ratio")
+    spread = analytics.get("iv_hv_spread")
+    hv_pct = analytics.get("hv_percentile")
+    iv_rank = analytics.get("iv_rank")
+    regime = analytics.get("vol_regime", "—")
+    skew = analytics.get("skewness")
+    kurt = analytics.get("kurtosis")
+    ann_ret = analytics.get("ann_ret")
+
+    regime_clr = (_RED if regime == "IV CARA" else
+                  (_GREEN if regime == "IV BARATA" else _ORANGE))
+
+    # ── Metrics panel ──────────────────────────────────────────────────────
+    def _kv(label, value, color="#e0e0f0", sub=None):
+        sub_html = f'<div style="font-size:0.6rem;color:#505070;font-family:{_FONT_MONO}">{sub}</div>' if sub else ""
+        return (f'<div style="min-width:110px">'
+                f'<div style="font-size:0.58rem;color:#505070;font-family:{_FONT_MONO};'
+                f'text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px">{label}</div>'
+                f'<div style="font-size:1.05rem;font-weight:800;color:{color};'
+                f'font-family:{_FONT_MONO}">{value}</div>{sub_html}</div>')
+
+    hdr = (f'<div style="background:#0e0e1a;border:1px solid #1e1e30;border-radius:6px;'
+           f'padding:0.9rem 1.4rem;display:flex;gap:2rem;align-items:flex-start;'
+           f'flex-wrap:wrap;margin-bottom:0.8rem;">')
+    hdr += _kv("Régimen vol", regime, regime_clr)
+    hdr += _kv("ATM IV",   f"{atm_iv:.1f}%" if atm_iv else "—")
+    hdr += _kv("HV20",     f"{hv20:.1f}%"   if hv20  else "—", sub="20 días")
+    hdr += _kv("HV30",     f"{hv30:.1f}%"   if hv30  else "—", sub="30 días")
+    hdr += _kv("HV60",     f"{hv60:.1f}%"   if hv60  else "—", sub="60 días")
+    hdr += _kv("HV90",     f"{hv90:.1f}%"   if hv90  else "—", sub="90 días")
+    hdr += _kv("IV / HV30", f"{ratio:.2f}x" if ratio  else "—",
+               regime_clr,  sub="> 1.30 cara · < 0.80 barata")
+    hdr += _kv("IV − HV30", (f"+{spread:.1f}%" if spread >= 0 else f"{spread:.1f}%") if spread is not None else "—",
+               _RED if (spread or 0) > 0 else _GREEN,
+               sub="prima (+) o descuento (−)")
+    hdr += _kv("HV Percentile", f"{hv_pct:.0f}°" if hv_pct is not None else "—",
+               sub="vs historial 1 año")
+    hdr += _kv("IV Rank (proxy)", f"{iv_rank:.0f}" if iv_rank is not None else "—",
+               sub="0=mín histórico 100=máx")
+    hdr += _kv("Asimetría", f"{skew:.3f}"  if skew  is not None else "—",
+               _RED if (skew or 0) < -0.5 else "#e0e0f0",
+               sub="< 0 = cola izquierda")
+    hdr += _kv("Curtosis ex.", f"{kurt:.3f}" if kurt is not None else "—",
+               sub="> 0 = colas gruesas")
+    hdr += "</div>"
+    st.markdown(hdr, unsafe_allow_html=True)
+
+    # Interpretation
+    if ratio is not None:
+        if ratio > 1.3:
+            interp = (f"📛 <b>IV cara</b> — Las opciones cotizan {ratio:.1f}x la HV30 realizada. "
+                      "Estrategias de venta de volatilidad (credit spreads, iron condors, covered calls) "
+                      "tienen ventaja estadística. La prima pagada por el mercado excede la vol realizada.")
+        elif ratio < 0.8:
+            interp = (f"💚 <b>IV barata</b> — Las opciones cotizan {ratio:.1f}x la HV30 realizada. "
+                      "Comprar volatilidad (straddles, debit spreads, calendars) es favorable. "
+                      "El mercado está subestimando la volatilidad que realmente está ocurriendo.")
+        else:
+            interp = (f"🟡 <b>IV neutral</b> — Las opciones cotizan {ratio:.1f}x la HV30. "
+                      "Sin ventaja clara para compradores o vendedores de volatilidad. "
+                      "Prioriza estrategias direccionales con spreads definidos.")
+    else:
+        interp = "Datos insuficientes para determinar el régimen de volatilidad."
+
+    st.markdown(
+        f'<p style="font-size:0.73rem;color:#7070a0;font-family:{_FONT_MONO};'
+        f'margin:0 0 1rem;line-height:1.6">{interp}</p>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Charts ─────────────────────────────────────────────────────────────
+    c_cone, c_hist = st.columns([3, 2])
+    with c_cone:
+        st.markdown('<p class="bb-header" style="margin-top:0">VOLATILITY CONE</p>',
+                    unsafe_allow_html=True)
+        st.caption("Bandas históricas de HV. La línea verde = ATM IV actual. "
+                   "IV sobre la banda P75 → cara. Bajo P25 → barata.")
+        fig_cone = chart_vol_cone(analytics, atm_iv, symbol)
+        if fig_cone: st.plotly_chart(fig_cone, use_container_width=True)
+
+    with c_hist:
+        st.markdown('<p class="bb-header" style="margin-top:0">HV30 HISTÓRICA vs ATM IV</p>',
+                    unsafe_allow_html=True)
+        st.caption("Serie temporal de la volatilidad realizada a 30 días.")
+        fig_hv = chart_iv_hv_history(analytics, atm_iv)
+        if fig_hv: st.plotly_chart(fig_hv, use_container_width=True)
+
+    # Returns distribution
+    st.markdown('<p class="bb-header">DISTRIBUCIÓN DE RETORNOS DIARIOS</p>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Histograma de retornos reales vs distribución normal teórica. "
+        "Curtosis > 0 = colas gruesas (fat tails) = riesgo extremo mayor de lo que la vol implica."
+    )
+    fig_rd = chart_returns_dist(analytics, symbol)
+    if fig_rd: st.plotly_chart(fig_rd, use_container_width=True)
     if skew_df.empty:
         return None
     fig = make_subplots(rows=1, cols=2,
@@ -1510,7 +2029,16 @@ def show_dashboard():
     total_gex   = gex_key.get("total_gex_bn")
     skew_df = calc_iv_skew(calls, puts, spot)
     ts_df   = calc_term_structure(calls_all, spot)
+    dex_data = calc_dex_advanced(calls_all, puts_all, spot)
     last_refresh = st.session_state.get("last_refresh", datetime.datetime.now())
+
+    # ── Price history (cached per symbol per day) ─────────────────────────────
+    ph_key = f"ph_{symbol}_{today}"
+    if ph_key not in st.session_state:
+        # Silently fetch — don't block the rest of the UI
+        ph_df = fetch_price_history(symbol)
+        st.session_state[ph_key] = ph_df
+    price_df = st.session_state.get(ph_key, pd.DataFrame())
 
     # ── Metrics row ──────────────────────────────────────────────────────────
     chg_color  = "#22c55e" if chg >= 0 else "#f43f5e"
@@ -1600,11 +2128,23 @@ def show_dashboard():
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
-    # ── Delta Exposure ────────────────────────────────────────────────────────
-    st.markdown('<p class="bb-header">DELTA EXPOSURE</p>', unsafe_allow_html=True)
-    fig_de = chart_delta_exp(calls, puts, spot)
-    if fig_de:
-        st.plotly_chart(fig_de, use_container_width=True)
+    # ── DELTA EXPOSURE (DEX) — Tier 2 ────────────────────────────────────────
+    st.markdown('<p class="bb-header">DELTA EXPOSURE  (DEX)  ·  Tier 2</p>', unsafe_allow_html=True)
+    st.caption(
+        "DEX = OI × Delta × 100 × Spot. Mide el sesgo direccional neto del mercado de opciones. "
+        "Call-heavy = soporte implícito de hedging debajo del spot. "
+        "Put-heavy = resistencia implícita de hedging encima del spot."
+    )
+    fig_dex = chart_dex(dex_data, spot)
+    if fig_dex:
+        st.plotly_chart(fig_dex, use_container_width=True)
+
+    st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
+
+    # ── VOLATILITY ANALYSIS — Tier 2 ─────────────────────────────────────────
+    st.markdown('<p class="bb-header">VOLATILITY ANALYSIS  ·  HV · IV Rank · Cone · Returns</p>',
+                unsafe_allow_html=True)
+    render_vol_module(symbol, iv_atm, spot, price_df)
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown(
