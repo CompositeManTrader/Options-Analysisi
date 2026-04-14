@@ -1836,6 +1836,41 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
     return fig
 
 
+def chart_iv_skew(skew_df, spot):
+    if skew_df.empty:
+        return None
+    fig = make_subplots(rows=1, cols=2,
+        subplot_titles=["IV POR STRIKE  (Calls vs Puts)", "SKEW  (Put IV − Call IV)"],
+        horizontal_spacing=0.10)
+    fig.add_trace(go.Scatter(
+        x=skew_df["Strike"], y=skew_df["C_IV"], name="Call IV",
+        line=dict(color=_GREEN, width=2), mode="lines",
+        hovertemplate="Strike: %{x}<br>Call IV: %{y:.1f}%<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=skew_df["Strike"], y=skew_df["P_IV"], name="Put IV",
+        line=dict(color=_RED, width=2), mode="lines",
+        hovertemplate="Strike: %{x}<br>Put IV: %{y:.1f}%<extra></extra>",
+    ), row=1, col=1)
+    _vline(fig, spot, row=1, col=1)
+    skew_colors = [_RED if v > 0 else _GREEN for v in skew_df["Skew"]]
+    fig.add_trace(go.Bar(
+        x=skew_df["Strike"], y=skew_df["Skew"],
+        marker_color=skew_colors, marker_line_width=0,
+        name="Skew", showlegend=False,
+        hovertemplate="Strike: %{x}<br>Skew: %{y:.1f}%<extra></extra>",
+    ), row=1, col=2)
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.08)", row=1, col=2)
+    _vline(fig, spot, row=1, col=2)
+    fig.update_layout(height=320, **_BASE)
+    fig.update_xaxes(**_AX_NOZERO, title_text="Strike")
+    fig.update_yaxes(**_AX_NOZERO, title_text="IV (%)", row=1, col=1)
+    fig.update_yaxes(**_AX_ZERO, title_text="Put IV − Call IV (%)", row=1, col=2)
+    for ann in fig.layout.annotations:
+        ann.font.update(size=10, color="#606080", family=_FONT_MONO)
+    return fig
+
+
 def chart_term_structure(ts_df):
     if ts_df.empty or len(ts_df) < 2:
         return None
