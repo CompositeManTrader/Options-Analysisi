@@ -784,17 +784,26 @@ def calc_gex_advanced(c_all, p_all, spot):
 def calc_gex_by_expiry(c_all, p_all, spot):
     """Net GEX contribution per expiration."""
     if c_all.empty: return pd.DataFrame()
+    all_exps = sorted(set(
+        (c_all["Expiry"].dropna().tolist() if "Expiry" in c_all.columns else []) +
+        (p_all["Expiry"].dropna().tolist() if not p_all.empty and "Expiry" in p_all.columns else [])
+    ))
     rows = []
-    for exp in sorted(set(c_all.get("Expiry", pd.Series()).tolist() +
-                          (p_all.get("Expiry", pd.Series()).tolist() if not p_all.empty else []))):
-        c = c_all[c_all["Expiry"]==exp] if "Expiry" in c_all.columns else pd.DataFrame()
-        p = p_all[p_all["Expiry"]==exp] if not p_all.empty and "Expiry" in p_all.columns else pd.DataFrame()
-        dte  = int(float(str(c["DTE"].values[0]))) if not c.empty and "DTE" in c.columns else 0
+    for exp in all_exps:
+        c = c_all[c_all["Expiry"] == exp] if "Expiry" in c_all.columns else pd.DataFrame()
+        p = p_all[p_all["Expiry"] == exp] if not p_all.empty and "Expiry" in p_all.columns else pd.DataFrame()
+        # Safe DTE extraction — handles numpy scalars, arrays, strings
+        dte = 0
+        if not c.empty and "DTE" in c.columns:
+            try:
+                dte = int(float(np.asarray(c["DTE"].dropna().values[0]).flat[0]))
+            except Exception:
+                dte = 0
         c_gex = (c["Gamma"] * c["OI"] * 100 * spot**2).sum() if not c.empty and "Gamma" in c.columns else 0
         p_gex = -(p["Gamma"] * p["OI"] * 100 * spot**2).sum() if not p.empty and "Gamma" in p.columns else 0
         rows.append({"Expiry": exp, "DTE": dte,
-                     "Call_GEX": c_gex/1e9, "Put_GEX": p_gex/1e9,
-                     "Net_GEX": (c_gex+p_gex)/1e9})
+                     "Call_GEX": c_gex / 1e9, "Put_GEX": p_gex / 1e9,
+                     "Net_GEX": (c_gex + p_gex) / 1e9})
     return pd.DataFrame(rows).sort_values("DTE")
 
 
