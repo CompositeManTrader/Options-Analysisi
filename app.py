@@ -30,7 +30,7 @@ html, body, [data-testid="stApp"], .main, .block-container {
     background-color: #080810 !important;
     color: #c8c8d8 !important;
 }
-.block-container { padding: 0.8rem 1.6rem 2rem !important; max-width: 100% !important; }
+.block-container { padding: 2rem 1.6rem 2rem !important; max-width: 100% !important; }
 
 /* ── Inputs & selects ───────────────────────────────────────────────────── */
 input, textarea, select,
@@ -891,12 +891,13 @@ def chart_delta_exp(c, p, spot):
 # ═══════════════════════════════════════════════════════════════════════════════
 def show_dashboard():
     st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 
     # ── Top bar ─────────────────────────────────────────────────────────────
-    b1, b2, b3, b4, _, b5, b6 = st.columns([0.9, 1.2, 1.5, 0.8, 1.4, 0.9, 0.6])
+    b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.4, 1.8, 1.0, 1.0, 0.6])
 
     with b1:
-        st.markdown("<span style='font-family:JetBrains Mono,monospace;font-size:1rem;font-weight:800;color:#f97316;letter-spacing:0.12em;'>▤ OPTIONS</span>", unsafe_allow_html=True)
+        st.markdown("<span style='font-family:JetBrains Mono,monospace;font-size:1rem;font-weight:800;color:#f97316;letter-spacing:0.12em;line-height:2.4;display:block'>▤ OPTIONS</span>", unsafe_allow_html=True)
 
     with b2:
         symbol = st.text_input("sym", value=st.session_state.get("symbol","AAPL"),
@@ -913,7 +914,7 @@ def show_dashboard():
                                     index=3, label_visibility="collapsed")
 
     with b5:
-        auto_refresh = st.toggle("Auto-refresh 30s", value=False, key="auto_refresh_toggle")
+        auto_refresh = st.toggle("Auto 30s", value=False, key="auto_refresh_toggle")
 
     with b6:
         if st.button("EXIT", use_container_width=True):
@@ -979,7 +980,7 @@ def show_dashboard():
     vol_u = int(ul.get("totalVolume", 0) or 0)
 
     # ── Analytics ────────────────────────────────────────────────────────────
-    dte_v  = int(calls["DTE"].iloc[0]) if not calls.empty and "DTE" in calls.columns else 0
+    dte_v  = int(calls["DTE"].dropna().values[0]) if not calls.empty and "DTE" in calls.columns and len(calls["DTE"].dropna()) > 0 else 0
     iv_atm = calc_atm_iv(calls, spot)
     p_c    = calc_pcr(calls, puts)
     mp     = calc_max_pain(calls, puts)
