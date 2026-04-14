@@ -464,25 +464,41 @@ def show_connect_screen():
         st.link_button("🔐  AUTORIZAR EN SCHWAB", auth_url, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Step 2: paste redirect URL ─────────────────────────────────────
-        st.markdown('<div class="step-card">', unsafe_allow_html=True)
-        st.markdown('<span class="step-num">2</span><span class="step-label"> Pega la URL completa de la redirección:</span>', unsafe_allow_html=True)
-        redirect_url = st.text_input("redirect", label_visibility="collapsed",
-            placeholder="https://tuapp.streamlit.app?code=Xxxx&session=...")
-        st.markdown('</div>', unsafe_allow_html=True)
+        callback = st.session_state.get("callback_url", "")
+        is_streamlit_cloud = "streamlit.app" in callback or "streamlit.io" in callback
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("← Cancelar", use_container_width=True):
-                for k in ["oauth_pending","app_key","app_secret","callback_url"]:
-                    st.session_state.pop(k, None)
-                st.rerun()
-        with c2:
-            if st.button("CONECTAR →", type="primary", use_container_width=True):
-                if not redirect_url:
-                    st.error("Pega la URL de redirección.")
-                    return
-                _finish_oauth(redirect_url.strip())
+        if is_streamlit_cloud:
+            st.info(
+                "✅ **Flujo automático activo.**  \n"
+                "Al autorizar en Schwab serás redirigido de vuelta a esta app "
+                "y el código se captura solo. No necesitas copiar ni pegar nada.",
+                icon="🚀",
+            )
+        else:
+            # Local flow: still needs manual paste but with clear timing warning
+            st.warning(
+                "⚡ **Actúa rápido** — el código expira en ~30 segundos.  \n"
+                "Autoriza → copia la URL de redirección → pégala aquí de inmediato.",
+                icon="⏱",
+            )
+            st.markdown('<div class="step-card">', unsafe_allow_html=True)
+            st.markdown('<span class="step-num">2</span><span class="step-label"> Pega la URL completa de la redirección (tienes ~30s):</span>', unsafe_allow_html=True)
+            redirect_url = st.text_input("redirect", label_visibility="collapsed",
+                placeholder="https://127.0.0.1?code=Xxxx&session=...")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("← Cancelar", use_container_width=True):
+                    for k in ["oauth_pending","app_key","app_secret","callback_url"]:
+                        st.session_state.pop(k, None)
+                    st.rerun()
+            with c2:
+                if st.button("CONECTAR →", type="primary", use_container_width=True):
+                    if not redirect_url:
+                        st.error("Pega la URL de redirección.")
+                        return
+                    _finish_oauth(redirect_url.strip())
 
 
 def _finish_oauth(redirect_url):
@@ -1273,11 +1289,67 @@ def show_dashboard():
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
-    # 1. Try to connect silently using Streamlit Secrets (no UI needed)
+    # ── Auto-capture OAuth code from URL query params ─────────────────────
+    # When CALLBACK_URL = Streamlit app URL, Schwab redirects back here
+    # with ?code=xxx automatically. Capture it before anything else.
+    qp = st.query_params
+    if "code" in qp and not st.session_state.get("connected"):
+        code     = qp["code"]
+        callback = (
+            st.session_state.get("callback_url")
+            or _secret("CALLBACK_URL", "https://127.0.0.1")
+        )
+        app_key    = st.session_state.get("app_key") or _secret("APP_KEY")
+        app_secret = st.session_state.get("app_secret") or _secret("APP_SECRET")
+
+        if app_key and app_secret:
+            st.markdown(CSS, unsafe_allow_html=True)
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            _, col, _ = st.columns([1, 1.2, 1])
+            with col:
+                with st.spinner("Autenticando con Schwab…"):
+                    try:
+                        creds = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
+                        r = requests.post(
+                            _TOKEN_URL,
+                            headers={"Authorization": f"Basic {creds}",
+                                     "Content-Type": "application/x-www-form-urlencoded"},
+                            data={"grant_type": "authorization_code",
+                                  "code": code,
+                                  "redirect_uri": callback},
+                            timeout=15,
+                        )
+                        if r.ok:
+                            tok = r.json()
+                            st.session_state["app_key"]    = app_key
+                            st.session_state["app_secret"] = app_secret
+                            st.session_state["callback_url"] = callback
+                            st.session_state["tokens"] = {
+                                "access_token":  tok["access_token"],
+                                "refresh_token": tok["refresh_token"],
+                                "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                                    seconds=tok.get("expires_in", 1800)),
+                            }
+                            st.session_state["connected"] = True
+                            # Clear code from URL so it doesn't re-trigger
+                            st.query_params.clear()
+
+                            st.success("✅ Autenticado. Guarda este Refresh Token en Secrets:")
+                            st.code(f'REFRESH_TOKEN = "{tok["refresh_token"]}"', language="toml")
+                            st.caption("Streamlit Cloud → Manage App → Settings → Secrets → pega la línea → Save")
+                            if st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True):
+                                st.rerun()
+                            return
+                        else:
+                            st.error(f"Error {r.status_code}: {r.text}")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            return
+
+    # ── Normal flow ───────────────────────────────────────────────────────
     if not st.session_state.get("connected"):
         try_auto_connect()
 
-    # 2. Go straight to dashboard, or show connect screen if needed
     if st.session_state.get("connected"):
         show_dashboard()
     else:
