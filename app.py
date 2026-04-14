@@ -338,89 +338,188 @@ def api_get(path, params=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONNECT SCREEN
+#  AUTO-CONNECT via Streamlit Secrets
+# ═══════════════════════════════════════════════════════════════════════════════
+def _secret(key, default=None):
+    """Read from st.secrets, fall back to default."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+
+def try_auto_connect():
+    """
+    Try to connect silently using credentials stored in st.secrets.
+    Returns True if connected successfully, False otherwise.
+    Secrets required:
+        APP_KEY       = "..."
+        APP_SECRET    = "..."
+        CALLBACK_URL  = "https://yourapp.streamlit.app"
+        REFRESH_TOKEN = "..."   ← obtained once via OAuth
+    """
+    if st.session_state.get("connected"):
+        return True
+
+    app_key       = _secret("APP_KEY")
+    app_secret    = _secret("APP_SECRET")
+    refresh_token = _secret("REFRESH_TOKEN")
+
+    if not all([app_key, app_secret, refresh_token]):
+        return False  # secrets not configured → show connect screen
+
+    try:
+        creds = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
+        r = requests.post(
+            _TOKEN_URL,
+            headers={"Authorization": f"Basic {creds}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            timeout=15,
+        )
+        r.raise_for_status()
+        tok = r.json()
+
+        st.session_state["app_key"]    = app_key
+        st.session_state["app_secret"] = app_secret
+        st.session_state["callback_url"] = _secret("CALLBACK_URL", "https://127.0.0.1")
+        st.session_state["tokens"] = {
+            "access_token":  tok["access_token"],
+            "refresh_token": tok.get("refresh_token", refresh_token),
+            "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                seconds=tok.get("expires_in", 1800)),
+        }
+        st.session_state["connected"] = True
+        return True
+    except Exception:
+        return False  # refresh_token expired → show connect screen
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONNECT / RE-AUTH SCREEN  (only shown when secrets missing or token expired)
 # ═══════════════════════════════════════════════════════════════════════════════
 def show_connect_screen():
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown("<br>", unsafe_allow_html=True)
-    _, col, _ = st.columns([1, 1.15, 1])
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, col, _ = st.columns([1, 1.2, 1])
+
+    # Detect if this is first-time setup or an expired token
+    has_secrets = bool(_secret("APP_KEY") and _secret("APP_SECRET"))
+    is_expired  = has_secrets and not st.session_state.get("connected")
+
     with col:
-        st.markdown("""
-        <span class="conn-logo">▤</span>
-        <h1 class="conn-title">OPTIONS TERMINAL</h1>
-        <p class="conn-sub">Charles Schwab API — Conecta tu cuenta para continuar</p>
-        """, unsafe_allow_html=True)
+        if is_expired:
+            st.markdown("""
+            <span class="conn-logo">⚠</span>
+            <h1 class="conn-title" style="color:#f43f5e">TOKEN EXPIRADO</h1>
+            <p class="conn-sub">Tu refresh token expiró (válido 7 días). Re-autoriza una vez y copia el nuevo token a Secrets.</p>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <span class="conn-logo">▤</span>
+            <h1 class="conn-title">OPTIONS TERMINAL</h1>
+            <p class="conn-sub">Primera configuración — Solo necesitas hacer esto una vez.</p>
+            """, unsafe_allow_html=True)
 
-        if "oauth_pending" not in st.session_state:
-            with st.container():
-                app_key    = st.text_input("APP KEY",    placeholder="Obtenlo en developer.schwab.com")
-                app_secret = st.text_input("APP SECRET", type="password", placeholder="••••••••••••")
-                callback   = st.text_input("CALLBACK URL", value="https://127.0.0.1",
-                    help="Local → https://127.0.0.1  |  Streamlit Cloud → URL completa de tu app")
-            st.caption("⚠️ En Streamlit Cloud el callback debe ser la URL de tu app (ej. https://tuapp.streamlit.app) y debe estar registrada en developer.schwab.com")
+        # ── Step 0: credentials (only if not in secrets yet) ──────────────
+        if not has_secrets:
+            st.markdown('<div class="step-card">', unsafe_allow_html=True)
+            st.markdown('<span class="step-num">0</span><span class="step-label"> Credenciales (solo primera vez):</span>', unsafe_allow_html=True)
+            app_key    = st.text_input("APP KEY",    placeholder="developer.schwab.com → tu app")
+            app_secret = st.text_input("APP SECRET", type="password", placeholder="••••••••••")
+            callback   = st.text_input("CALLBACK URL", value="https://127.0.0.1",
+                help="Streamlit Cloud → URL de tu app  |  Local → https://127.0.0.1")
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            app_key    = _secret("APP_KEY")
+            app_secret = _secret("APP_SECRET")
+            callback   = _secret("CALLBACK_URL", "https://127.0.0.1")
+            st.info(f"✓ Credenciales cargadas desde Secrets. Callback: `{callback}`", icon="🔑")
 
-            if st.button("GENERAR ENLACE DE AUTENTICACIÓN", type="primary", use_container_width=True):
+        # ── Step 1: OAuth link ─────────────────────────────────────────────
+        if not has_secrets:
+            show_oauth = st.button("SIGUIENTE → GENERAR ENLACE", type="primary",
+                                   use_container_width=True)
+            if show_oauth:
                 if not app_key or not app_secret:
-                    st.error("App Key y App Secret son requeridos.")
+                    st.error("Completa App Key y App Secret.")
                     return
                 st.session_state.update({
-                    "app_key":       app_key.strip(),
-                    "app_secret":    app_secret.strip(),
-                    "callback_url":  callback.strip(),
-                    "oauth_pending": True,
+                    "app_key": app_key.strip(), "app_secret": app_secret.strip(),
+                    "callback_url": callback.strip(), "oauth_pending": True,
                 })
                 st.rerun()
+            if "oauth_pending" not in st.session_state:
+                return
         else:
-            auth_url = build_auth_url(st.session_state["app_key"], st.session_state["callback_url"])
+            st.session_state["app_key"]      = app_key
+            st.session_state["app_secret"]   = app_secret
+            st.session_state["callback_url"] = callback
 
-            st.markdown('<div class="step-card">', unsafe_allow_html=True)
-            st.markdown('<span class="step-num">1</span><span class="step-label"> Autoriza en Schwab:</span>', unsafe_allow_html=True)
-            st.link_button("🔐  INICIAR SESIÓN EN SCHWAB", auth_url, use_container_width=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+        auth_url = build_auth_url(st.session_state["app_key"], st.session_state["callback_url"])
 
-            st.markdown('<div class="step-card">', unsafe_allow_html=True)
-            st.markdown('<span class="step-num">2</span><span class="step-label"> Después de autorizar, pega aquí la URL completa a la que fuiste redirigido:</span>', unsafe_allow_html=True)
-            redirect_url = st.text_input("URL de redirección", label_visibility="collapsed",
-                placeholder="https://tuapp.streamlit.app?code=Xxxx&session=...")
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="step-card">', unsafe_allow_html=True)
+        st.markdown('<span class="step-num">1</span><span class="step-label"> Haz clic para autorizar en Schwab:</span>', unsafe_allow_html=True)
+        st.link_button("🔐  AUTORIZAR EN SCHWAB", auth_url, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("← Volver", use_container_width=True):
-                    st.session_state.pop("oauth_pending", None)
-                    st.rerun()
-            with c2:
-                if st.button("CONECTAR →", type="primary", use_container_width=True):
-                    if not redirect_url:
-                        st.error("Pega la URL de redirección.")
-                        return
-                    _finish_oauth(redirect_url.strip())
+        # ── Step 2: paste redirect URL ─────────────────────────────────────
+        st.markdown('<div class="step-card">', unsafe_allow_html=True)
+        st.markdown('<span class="step-num">2</span><span class="step-label"> Pega la URL completa de la redirección:</span>', unsafe_allow_html=True)
+        redirect_url = st.text_input("redirect", label_visibility="collapsed",
+            placeholder="https://tuapp.streamlit.app?code=Xxxx&session=...")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown("""
-        <p style="text-align:center;font-size:0.72rem;color:#3a3a5a;margin-top:1.5rem;font-family:monospace;">
-            Sin cuenta de desarrollador →
-            <a href="https://developer.schwab.com" target="_blank"
-               style="color:#f97316;text-decoration:none;">developer.schwab.com</a>
-        </p>""", unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("← Cancelar", use_container_width=True):
+                for k in ["oauth_pending","app_key","app_secret","callback_url"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+        with c2:
+            if st.button("CONECTAR →", type="primary", use_container_width=True):
+                if not redirect_url:
+                    st.error("Pega la URL de redirección.")
+                    return
+                _finish_oauth(redirect_url.strip())
 
 
 def _finish_oauth(redirect_url):
     try:
         code = parse_qs(urlparse(redirect_url).query).get("code", [None])[0]
         if not code:
-            st.error("No se encontró el código en la URL. Copia la URL completa de la barra de direcciones.")
+            st.error("No se encontró ?code= en la URL. Copia la URL completa de la barra de direcciones.")
             return
-        with st.spinner("Autenticando…"):
+        with st.spinner("Intercambiando código…"):
             tok = exchange_code(st.session_state["app_key"], st.session_state["app_secret"],
                                 code, st.session_state["callback_url"])
+
+        refresh_token = tok["refresh_token"]
         st.session_state["tokens"] = {
             "access_token":  tok["access_token"],
-            "refresh_token": tok["refresh_token"],
-            "expiry": datetime.datetime.utcnow() + datetime.timedelta(seconds=tok.get("expires_in", 1800)),
+            "refresh_token": refresh_token,
+            "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                seconds=tok.get("expires_in", 1800)),
         }
         st.session_state["connected"]     = True
         st.session_state["oauth_pending"] = False
-        st.rerun()
+
+        # ── Show refresh token so user can save it to Secrets ──────────────
+        st.success("✅ Autenticado correctamente.")
+        st.markdown("""
+        <div style="background:#0e0e1a;border:1px solid #f97316;border-radius:6px;padding:1rem 1.2rem;margin-top:1rem;">
+        <p style="color:#f97316;font-family:JetBrains Mono,monospace;font-size:0.75rem;font-weight:700;margin:0 0 0.5rem;">
+        ⭐ GUARDA ESTE REFRESH TOKEN EN STREAMLIT SECRETS — no tendrás que volver a autenticarte por 7 días:
+        </p>
+        """, unsafe_allow_html=True)
+        st.code(f'REFRESH_TOKEN = "{refresh_token}"', language="toml")
+        st.markdown("""
+        <p style="color:#606080;font-family:JetBrains Mono,monospace;font-size:0.7rem;margin:0.5rem 0 0;">
+        En Streamlit Cloud: <b>Manage App → Settings → Secrets</b> → agrega la línea de arriba.
+        </p></div>
+        """, unsafe_allow_html=True)
+        st.button("ENTRAR AL DASHBOARD →", type="primary", use_container_width=True,
+                  on_click=lambda: st.rerun())
     except Exception as e:
         st.error(f"Error al obtener tokens: {e}")
 
@@ -1130,6 +1229,11 @@ def show_dashboard():
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    # 1. Try to connect silently using Streamlit Secrets (no UI needed)
+    if not st.session_state.get("connected"):
+        try_auto_connect()
+
+    # 2. Go straight to dashboard, or show connect screen if needed
     if st.session_state.get("connected"):
         show_dashboard()
     else:
