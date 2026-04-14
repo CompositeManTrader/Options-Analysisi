@@ -1,10 +1,5 @@
-# ─── Credenciales — NUNCA subir ──────────────────────────────────────────────
-.env
-.env.local
-.streamlit/secrets.toml
-
-# ─── Tokens de Schwab ────────────────────────────────────────────────────────
-~/.schwabdev/
+# ─── Tokens de Schwab (generados tras autenticarse) ──────────────────────────
+.schwabdev/
 tokens.db
 *.db
 
@@ -19,7 +14,6 @@ env/
 *.egg-info/
 dist/
 build/
-.eggs/
 
 # ─── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
