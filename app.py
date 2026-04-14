@@ -691,24 +691,138 @@ def calc_expected_move(spot, iv_pct, dte):
     return round(spot - move, 2), round(spot + move, 2)
 
 
-def calc_gex(c, p, spot):
+_RF_RATE = 0.045  # Risk-free rate (~Fed funds); update periodically
+
+def _sf(x, d=0.0):
+    try: return float(x)
+    except: return d
+
+def _bs_d1d2(S, K, T, sigma, r=_RF_RATE):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return None, None
+    try:
+        d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        return d1, d1 - sigma*np.sqrt(T)
+    except:
+        return None, None
+
+def _phi(x):
+    return np.exp(-x**2/2) / np.sqrt(2*np.pi)
+
+def bs_vanna(S, K, T, sigma, r=_RF_RATE):
+    """Vanna = dDelta/dVol = -exp(-d1²/2)/(√2π) × d2/sigma"""
+    d1, d2 = _bs_d1d2(S, K, T, sigma, r)
+    if d1 is None: return 0.0
+    return -_phi(d1) * d2 / sigma
+
+def bs_charm(S, K, T, sigma, r=_RF_RATE):
+    """Charm = dDelta/dt — delta decay per day"""
+    d1, d2 = _bs_d1d2(S, K, T, sigma, r)
+    if d1 is None or T <= 0: return 0.0
+    return _phi(d1) * (2*r*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
+
+
+def calc_gex_advanced(c_all, p_all, spot):
     """
-    GEX = (Call_OI × Call_Gamma − Put_OI × Put_Gamma) × 100 × Spot²
-    Positive GEX → MM long gamma → suppresses volatility
-    Negative GEX → MM short gamma → amplifies volatility
+    Full GEX across ALL expirations. Returns:
+    - gex_df: per-strike DataFrame with Call_GEX, Put_GEX, Net_GEX
+    - key: dict with regime, total_gex_bn, gex_per_1pct_mn, gamma_flip,
+            call_wall, put_wall, zero_gamma_pct
     """
-    if c.empty or "Gamma" not in c.columns:
-        return pd.DataFrame()
-    c2, p2 = c.copy(), p.copy()
-    c2["GEX"] =  c2["OI"] * c2["Gamma"] * 100 * spot**2
-    p2["GEX"] = -p2["OI"] * p2["Gamma"].abs() * 100 * spot**2
-    merged = (
-        c2[["Strike","GEX"]].rename(columns={"GEX":"C_GEX"})
-        .merge(p2[["Strike","GEX"]].rename(columns={"GEX":"P_GEX"}), on="Strike", how="outer")
-        .fillna(0)
+    if c_all.empty or "Gamma" not in c_all.columns:
+        return pd.DataFrame(), {}
+
+    c2 = c_all[["Strike","OI","Gamma"]].copy()
+    p2 = p_all[["Strike","OI","Gamma"]].copy() if not p_all.empty else pd.DataFrame()
+
+    c2["C_GEX"] = c2["OI"] * c2["Gamma"] * 100 * spot**2
+    if not p2.empty:
+        p2["P_GEX"] = -p2["OI"] * p2["Gamma"].abs() * 100 * spot**2
+
+    c_grp = c2.groupby("Strike")["C_GEX"].sum().reset_index()
+    p_grp = p2.groupby("Strike")["P_GEX"].sum().reset_index() if not p2.empty else pd.DataFrame(columns=["Strike","P_GEX"])
+
+    gex = c_grp.merge(p_grp, on="Strike", how="outer").fillna(0).sort_values("Strike")
+    gex["Net_GEX"] = gex["C_GEX"] + gex["P_GEX"]
+    gex["Abs_GEX"] = gex["Net_GEX"].abs()
+
+    total      = gex["Net_GEX"].sum()
+    total_bn   = round(total / 1e9, 2)
+    per_1pct_mn = round(abs(total) * 0.01 / 1e6, 1)
+
+    # Gamma Flip (HVL): cumulative GEX crossing zero from low to high strikes
+    gex_s = gex.sort_values("Strike").copy()
+    gex_s["CumGEX"] = gex_s["Net_GEX"].cumsum()
+    gamma_flip = None
+    cum = gex_s["CumGEX"].values; stk = gex_s["Strike"].values
+    for i in range(1, len(cum)):
+        if cum[i-1] * cum[i] < 0:
+            w = abs(cum[i-1]) / (abs(cum[i-1]) + abs(cum[i]) + 1e-9)
+            gamma_flip = round(float(stk[i-1] + (stk[i]-stk[i-1]) * w), 2)
+            break
+
+    # Call Wall: highest positive Net_GEX strike
+    pos = gex[gex["Net_GEX"] > 0]
+    call_wall = round(float(pos.loc[pos["Net_GEX"].idxmax(), "Strike"]), 2) if not pos.empty else None
+    # Put Wall: most negative Net_GEX strike
+    neg = gex[gex["Net_GEX"] < 0]
+    put_wall  = round(float(neg.loc[neg["Net_GEX"].idxmin(), "Strike"]), 2) if not neg.empty else None
+
+    regime = "POSITIVE" if total > 0 else ("NEGATIVE" if total < 0 else "NEUTRAL")
+    zero_pct = round((gamma_flip - spot) / spot * 100, 2) if gamma_flip else None
+
+    key = dict(
+        total_gex=total, total_gex_bn=total_bn,
+        gex_per_1pct_mn=per_1pct_mn, regime=regime,
+        gamma_flip=gamma_flip, call_wall=call_wall, put_wall=put_wall,
+        zero_gamma_pct=zero_pct,
     )
-    merged["Net_GEX"] = merged["C_GEX"] + merged["P_GEX"]
-    return merged.sort_values("Strike")
+    gex_s["CumGEX_Bn"] = gex_s["CumGEX"] / 1e9
+    return gex_s, key
+
+
+def calc_gex_by_expiry(c_all, p_all, spot):
+    """Net GEX contribution per expiration."""
+    if c_all.empty: return pd.DataFrame()
+    rows = []
+    for exp in sorted(set(c_all.get("Expiry", pd.Series()).tolist() +
+                          (p_all.get("Expiry", pd.Series()).tolist() if not p_all.empty else []))):
+        c = c_all[c_all["Expiry"]==exp] if "Expiry" in c_all.columns else pd.DataFrame()
+        p = p_all[p_all["Expiry"]==exp] if not p_all.empty and "Expiry" in p_all.columns else pd.DataFrame()
+        dte  = int(float(str(c["DTE"].values[0]))) if not c.empty and "DTE" in c.columns else 0
+        c_gex = (c["Gamma"] * c["OI"] * 100 * spot**2).sum() if not c.empty and "Gamma" in c.columns else 0
+        p_gex = -(p["Gamma"] * p["OI"] * 100 * spot**2).sum() if not p.empty and "Gamma" in p.columns else 0
+        rows.append({"Expiry": exp, "DTE": dte,
+                     "Call_GEX": c_gex/1e9, "Put_GEX": p_gex/1e9,
+                     "Net_GEX": (c_gex+p_gex)/1e9})
+    return pd.DataFrame(rows).sort_values("DTE")
+
+
+def calc_second_order_greeks(calls, puts, spot, r=_RF_RATE):
+    """Add Vanna and Charm columns using Black-Scholes."""
+    for df, opt_t in [(calls, "call"), (puts, "put")]:
+        if df.empty or not all(c in df.columns for c in ["Strike","IV%","DTE"]):
+            continue
+        vannas, charms = [], []
+        for _, row in df.iterrows():
+            K  = _sf(row.get("Strike", 0))
+            iv = _sf(row.get("IV%", 0)) / 100
+            T  = max(_sf(row.get("DTE", 0)) / 365, 1e-6)
+            sign = -1 if opt_t == "put" else 1
+            v = bs_vanna(spot, K, T, iv, r)
+            c = bs_charm(spot, K, T, iv, r)
+            vannas.append(round(sign * v, 6))
+            charms.append(round(sign * c, 6))
+        df = df.copy()
+        df["Vanna"] = vannas
+        df["Charm"] = charms
+    return calls, puts
+
+
+def calc_gex(c, p, spot):
+    """Backward-compat wrapper used by the metrics row."""
+    gex_df, _ = calc_gex_advanced(c, p, spot)
+    return gex_df
 
 
 def calc_iv_skew(c, p, spot):
@@ -891,38 +1005,270 @@ def chart_greeks(c, p, spot):
     return fig
 
 
-def chart_gex(gex_df, spot):
-    if gex_df.empty:
-        return None
-    total_gex = gex_df["Net_GEX"].sum() / 1e9
-    flip_candidates = gex_df[gex_df["Net_GEX"].diff().apply(np.sign).diff() != 0]
+def chart_gex_ladder(gex_df, spot, key, iv_adj=0.0):
+    """
+    Horizontal GEX ladder — GEXBot signature chart.
+    Calls extend RIGHT (green), Puts LEFT (red).
+    Y-axis = strike prices. Focus ±15% of spot.
+    iv_adj: optional IV adjustment multiplier for sensitivity analysis.
+    """
+    if gex_df.empty: return None
+    rng  = spot * 0.16
+    df   = gex_df[(gex_df["Strike"] >= spot-rng) & (gex_df["Strike"] <= spot+rng)].copy()
+    if df.empty: df = gex_df.copy()
+
+    adj  = 1.0 + iv_adj   # simple scaling for sensitivity
+    sc   = 1e9
 
     fig = go.Figure()
-    colors = [_GREEN if v >= 0 else _RED for v in gex_df["Net_GEX"]]
     fig.add_trace(go.Bar(
-        x=gex_df["Strike"], y=gex_df["Net_GEX"] / 1e6,
-        marker_color=colors,
-        marker_line=dict(width=0),
-        name="Net GEX",
-        hovertemplate="Strike: %{x}<br>GEX: %{y:.1f}M<extra></extra>",
+        y=df["Strike"], x=df["C_GEX"]*adj/sc, orientation="h", name="Call GEX",
+        marker=dict(color="rgba(34,197,94,0.72)", line=dict(width=0)),
+        hovertemplate="Strike: $%{y:.1f}<br>Call GEX: $%{x:.2f}B<extra></extra>",
     ))
-    _vline(fig, spot)
-    # GEX flip point
-    sign_change = gex_df[gex_df["Net_GEX"] * gex_df["Net_GEX"].shift(1) < 0]
-    for _, row in sign_change.iterrows():
-        fig.add_vline(x=row["Strike"], line_dash="dashdot",
-                      line_color="rgba(249,115,22,0.3)", line_width=1)
+    fig.add_trace(go.Bar(
+        y=df["Strike"], x=df["P_GEX"]*adj/sc, orientation="h", name="Put GEX",
+        marker=dict(color="rgba(244,63,94,0.72)", line=dict(width=0)),
+        hovertemplate="Strike: $%{y:.1f}<br>Put GEX: $%{x:.2f}B<extra></extra>",
+    ))
+
+    # Spot line
+    fig.add_hline(y=spot, line_dash="solid", line_color=_ORANGE, line_width=1.8,
+                  annotation_text=f"  SPOT  ${spot:.2f}", annotation_font_size=10,
+                  annotation_font_color=_ORANGE, annotation_position="top right")
+
+    # Gamma Flip / HVL
+    gf = key.get("gamma_flip")
+    if gf:
+        fig.add_hline(y=gf, line_dash="dot", line_color="#a855f7", line_width=1.2,
+                      annotation_text=f"  HVL  ${gf:.0f}", annotation_font_size=9,
+                      annotation_font_color="#a855f7", annotation_position="bottom right")
+
+    # Call Wall
+    cw = key.get("call_wall")
+    if cw:
+        fig.add_hline(y=cw, line_dash="dashdot", line_color=_GREEN, line_width=1,
+                      annotation_text=f"  CALL WALL  ${cw:.0f}", annotation_font_size=9,
+                      annotation_font_color=_GREEN, annotation_position="bottom right")
+
+    # Put Wall
+    pw = key.get("put_wall")
+    if pw:
+        fig.add_hline(y=pw, line_dash="dashdot", line_color=_RED, line_width=1,
+                      annotation_text=f"  PUT WALL  ${pw:.0f}", annotation_font_size=9,
+                      annotation_font_color=_RED, annotation_position="bottom right")
+
+    # Zero GEX center line
+    fig.add_vline(x=0, line_dash="dot", line_color="rgba(255,255,255,0.08)", line_width=1)
+
+    regime_clr = _GREEN if key.get("regime") == "POSITIVE" else _RED
     fig.update_layout(
-        height=320,
-        xaxis_title="Strike",
-        yaxis_title="Net GEX ($ Millones)",
-        title=dict(text=f"  GAMMA EXPOSURE  |  Net GEX: {'${:.2f}B'.format(total_gex)}  |  {'LONG GAMMA ▲' if total_gex >= 0 else 'SHORT GAMMA ▼'}",
-                   font=dict(size=11, color=_GREEN if total_gex >= 0 else _RED, family=_FONT_MONO), x=0),
+        height=600, barmode="overlay",
+        xaxis_title="GEX ($B)",
+        yaxis=dict(**_AX_NOZERO, tickformat="$,.0f", title="Strike"),
+        xaxis=dict(**_AX_ZERO),
+        title=dict(
+            text=f"  {key.get('regime','?')} GAMMA  |  Net: ${key.get('total_gex_bn',0):+.2f}B"
+                 f"  |  GEX/1%: ${key.get('gex_per_1pct_mn',0):.0f}M"
+                 + (f"  |  IV adj: {iv_adj:+.0%}" if iv_adj != 0 else ""),
+            font=dict(size=11, color=regime_clr, family=_FONT_MONO), x=0
+        ),
         **_BASE,
     )
-    fig.update_xaxes(**_AX_NOZERO, title_text="Strike")
+    return fig
+
+
+def chart_gex_cumulative(gex_df, spot, key):
+    """Cumulative GEX profile — shows gamma flip crossing."""
+    if gex_df.empty or "CumGEX_Bn" not in gex_df.columns: return None
+    df = gex_df.sort_values("Strike")
+    pos = df[df["CumGEX_Bn"] >= 0]
+    neg = df[df["CumGEX_Bn"] < 0]
+    fig = go.Figure()
+    if not pos.empty:
+        fig.add_trace(go.Scatter(
+            x=pos["Strike"], y=pos["CumGEX_Bn"], mode="lines", name="+GEX",
+            line=dict(color=_GREEN, width=2),
+            fill="tozeroy", fillcolor="rgba(34,197,94,0.08)",
+            hovertemplate="Strike: $%{x}<br>Cum GEX: $%{y:.2f}B<extra></extra>",
+        ))
+    if not neg.empty:
+        fig.add_trace(go.Scatter(
+            x=neg["Strike"], y=neg["CumGEX_Bn"], mode="lines", name="-GEX",
+            line=dict(color=_RED, width=2),
+            fill="tozeroy", fillcolor="rgba(244,63,94,0.08)",
+            hovertemplate="Strike: $%{x}<br>Cum GEX: $%{y:.2f}B<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.12)", line_width=1)
+    _vline(fig, spot)
+    gf = key.get("gamma_flip")
+    if gf:
+        fig.add_vline(x=gf, line_dash="dot", line_color="#a855f7", line_width=1.2,
+                      annotation_text=f"  HVL ${gf:.0f}", annotation_font_size=9,
+                      annotation_font_color="#a855f7")
+    fig.update_layout(height=240, xaxis_title="Strike", yaxis_title="Cum GEX ($B)", **_BASE)
+    fig.update_xaxes(**_AX_NOZERO)
     fig.update_yaxes(**_AX_ZERO)
     return fig
+
+
+def chart_gex_by_expiry(expiry_df):
+    """Stacked bar: GEX contribution per expiration."""
+    if expiry_df.empty or len(expiry_df) < 2: return None
+    df = expiry_df.copy()
+    df["Abs"] = df["Net_GEX"].abs()
+    df = df.nlargest(14, "Abs").sort_values("DTE")
+    labels = [f"{r['Expiry'][5:]}  ({r['DTE']}d)" for _, r in df.iterrows()]
+    fig = go.Figure([
+        go.Bar(x=labels, y=df["Call_GEX"], name="Calls",
+               marker=dict(color="rgba(34,197,94,0.72)", line=dict(width=0)),
+               hovertemplate="%{x}<br>Call GEX: $%{y:.2f}B<extra></extra>"),
+        go.Bar(x=labels, y=df["Put_GEX"], name="Puts",
+               marker=dict(color="rgba(244,63,94,0.72)", line=dict(width=0)),
+               hovertemplate="%{x}<br>Put GEX: $%{y:.2f}B<extra></extra>"),
+    ])
+    fig.update_layout(height=300, barmode="relative",
+                      xaxis_title="Expiración", yaxis_title="GEX ($B)", **_BASE)
+    fig.update_xaxes(**_AX_NOZERO, tickangle=-40)
+    fig.update_yaxes(**_AX_ZERO)
+    return fig
+
+
+def chart_vanna_charm(calls, puts, spot):
+    """2nd-order Greeks: Vanna and Charm."""
+    has_vanna = "Vanna" in calls.columns or "Vanna" in puts.columns
+    has_charm = "Charm" in calls.columns or "Charm" in puts.columns
+    if not has_vanna and not has_charm: return None
+
+    fig = make_subplots(rows=1, cols=2,
+        subplot_titles=["VANNA  dΔ/dVol", "CHARM  dΔ/dt  (delta decay/día)"],
+        horizontal_spacing=0.10)
+    for col_name, r, cc in [("Vanna",1,1), ("Charm",1,2)]:
+        for df, lbl, clr in [(calls,"Calls",_GREEN),(puts,"Puts",_RED)]:
+            if df.empty or col_name not in df.columns: continue
+            d = df.sort_values("Strike")
+            fig.add_trace(go.Scatter(
+                x=d["Strike"], y=d[col_name], name=lbl,
+                line=dict(color=clr, width=2), mode="lines",
+                showlegend=(r==1 and cc==1), legendgroup=lbl,
+                hovertemplate=f"Strike: %{{x}}<br>{col_name}: %{{y:.5f}}<extra>{lbl}</extra>",
+            ), row=r, col=cc)
+        _vline(fig, spot, row=r, col=cc)
+    fig.update_layout(height=280, **_BASE)
+    fig.update_xaxes(**_AX_NOZERO, title_text="Strike")
+    fig.update_yaxes(**_AX_ZERO)
+    for ann in fig.layout.annotations:
+        ann.font.update(size=10, color="#606080", family=_FONT_MONO)
+    return fig
+
+
+def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
+    """
+    Full professional GEX module — GEXBot-style.
+    Includes: regime header, ladder, cumulative profile,
+    expiry breakdown, 2nd-order Greeks, IV sensitivity.
+    """
+    gex_df, key = calc_gex_advanced(calls_all, puts_all, spot)
+    expiry_df   = calc_gex_by_expiry(calls_all, puts_all, spot)
+    calls_v, puts_v = calc_second_order_greeks(
+        calls_exp.copy(), puts_exp.copy(), spot)
+
+    regime    = key.get("regime", "N/A")
+    r_color   = _GREEN if regime == "POSITIVE" else (_RED if regime == "NEGATIVE" else _ORANGE)
+    total_bn  = key.get("total_gex_bn", 0)
+    gex_sign  = "+" if total_bn >= 0 else ""
+    gf        = key.get("gamma_flip")
+    cw        = key.get("call_wall")
+    pw        = key.get("put_wall")
+    zp        = key.get("zero_gamma_pct")
+
+    # ── Regime header ──────────────────────────────────────────────────────
+    def _kv(label, value, color="#e0e0f0"):
+        return (f'<div style="min-width:110px">'
+                f'<div style="font-size:0.58rem;color:#505070;font-family:{_FONT_MONO};'
+                f'text-transform:uppercase;letter-spacing:0.1em;margin-bottom:2px">{label}</div>'
+                f'<div style="font-size:1.05rem;font-weight:800;color:{color};'
+                f'font-family:{_FONT_MONO}">{value}</div></div>')
+
+    hdr = (f'<div style="background:#0e0e1a;border:1px solid #1e1e30;border-radius:6px;'
+           f'padding:0.9rem 1.4rem;display:flex;gap:2rem;align-items:center;flex-wrap:wrap;'
+           f'margin-bottom:0.8rem;">')
+    hdr += _kv("Régimen", f"{regime} Γ", r_color)
+    hdr += _kv("Net GEX", f"${gex_sign}{total_bn:.2f}B", r_color)
+    hdr += _kv("GEX / 1% move", f"${key.get('gex_per_1pct_mn',0):.0f}M")
+    hdr += _kv("HVL / Gamma Flip", f"${gf:.0f}" if gf else "—", "#a855f7")
+    if gf and zp is not None:
+        sign = "▲" if zp > 0 else "▼"
+        hdr += _kv("Spot → HVL", f"{sign} {abs(zp):.1f}%",
+                   _GREEN if zp > 0 else _RED)
+    hdr += _kv("Call Wall", f"${cw:.0f}" if cw else "—", _GREEN)
+    hdr += _kv("Put Wall",  f"${pw:.0f}" if pw else "—", _RED)
+    hdr += "</div>"
+    st.markdown(hdr, unsafe_allow_html=True)
+
+    # Interpretation
+    if regime == "POSITIVE":
+        msg = ("🟢 <b>Long Gamma (estabilizador)</b> — Los MMs venden rallies y compran "
+               "caídas. Espera rangos más estrechos y comportamiento <i>mean-reverting</i>. "
+               f"El spot debe superar el HVL (<b>${gf:.0f}</b>) para cambiar de régimen." if gf else
+               "🟢 <b>Long Gamma</b> — régimen estabilizador.")
+    elif regime == "NEGATIVE":
+        msg = ("🔴 <b>Short Gamma (amplificador)</b> — Los MMs compran rallies y venden "
+               "caídas. Los movimientos tienden a <i>acelerarse</i>. "
+               f"Vigilar el HVL en <b>${gf:.0f}</b> como pivote de régimen." if gf else
+               "🔴 <b>Short Gamma</b> — régimen amplificador.")
+    else:
+        msg = "🟡 <b>Gamma Neutral / Transitional</b> — mercado en equilibrio cerca del flip point."
+    st.markdown(
+        f'<p style="font-size:0.73rem;color:#7070a0;font-family:{_FONT_MONO};'
+        f'margin:0 0 1rem;line-height:1.6">{msg}</p>',
+        unsafe_allow_html=True)
+
+    # ── IV Sensitivity slider ──────────────────────────────────────────────
+    iv_adj = st.slider(
+        "IV Sensitivity — ajusta la IV implícita para ver cómo cambia el GEX",
+        min_value=-50, max_value=50, value=0, step=5,
+        format="%d%%", key="gex_iv_adj",
+    ) / 100.0
+
+    # ── Main 2-column layout ───────────────────────────────────────────────
+    col_l, col_r = st.columns([3, 1])
+
+    with col_l:
+        st.markdown('<p class="bb-header" style="margin-top:0.3rem">GEX LADDER  (todos los vencimientos)</p>',
+                    unsafe_allow_html=True)
+        st.caption("Calls → derecha (verde) · Puts → izquierda (rojo) · HVL = Gamma Flip")
+        fig_lad = chart_gex_ladder(gex_df, spot, key, iv_adj)
+        if fig_lad: st.plotly_chart(fig_lad, use_container_width=True)
+
+    with col_r:
+        st.markdown('<p class="bb-header" style="margin-top:0.3rem">GEX POR VENCIMIENTO</p>',
+                    unsafe_allow_html=True)
+        fig_exp = chart_gex_by_expiry(expiry_df)
+        if fig_exp:
+            st.plotly_chart(fig_exp, use_container_width=True)
+        else:
+            st.caption("Requiere >1 vencimiento.")
+
+    # ── Cumulative profile ─────────────────────────────────────────────────
+    st.markdown('<p class="bb-header">PERFIL ACUMULADO</p>', unsafe_allow_html=True)
+    st.caption("Suma acumulada de GEX desde el strike más bajo al más alto. "
+               "El cruce por cero = Gamma Flip / HVL — donde el régimen cambia.")
+    fig_cum = chart_gex_cumulative(gex_df, spot, key)
+    if fig_cum: st.plotly_chart(fig_cum, use_container_width=True)
+
+    # ── 2nd-order Greeks ───────────────────────────────────────────────────
+    st.markdown('<p class="bb-header">GREEKS DE 2° ORDEN  —  Vanna & Charm</p>',
+                unsafe_allow_html=True)
+    st.caption(
+        "**Vanna** (dΔ/dVol): cuánto cambia Delta si la IV sube/baja — clave para "
+        "rallies/sell-offs con expansión de volatilidad. "
+        "**Charm** (dΔ/dt): decaimiento del Delta por día — esencial para 0DTE y estrategias "
+        "de delta-hedging intradía. Calculados con Black-Scholes."
+    )
+    fig_vc = chart_vanna_charm(calls_v, puts_v, spot)
+    if fig_vc: st.plotly_chart(fig_vc, use_container_width=True)
+    else: st.caption("Requiere columnas IV% y DTE en la cadena.")
 
 
 def chart_iv_skew(skew_df, spot):
@@ -1151,8 +1497,8 @@ def show_dashboard():
     p_c    = calc_pcr(calls, puts)
     mp     = calc_max_pain(calls, puts)
     em_lo, em_hi = calc_expected_move(spot, iv_atm, dte_v)
-    gex_df = calc_gex(calls, puts, spot)
-    total_gex = gex_df["Net_GEX"].sum() / 1e9 if not gex_df.empty else None
+    _, gex_key  = calc_gex_advanced(calls_all, puts_all, spot)
+    total_gex   = gex_key.get("total_gex_bn")
     skew_df = calc_iv_skew(calls, puts, spot)
     ts_df   = calc_term_structure(calls_all, spot)
     last_refresh = st.session_state.get("last_refresh", datetime.datetime.now())
@@ -1203,29 +1549,9 @@ def show_dashboard():
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
-    # ── GEX ──────────────────────────────────────────────────────────────────
-    st.markdown('<p class="bb-header">GAMMA EXPOSURE  (GEX)</p>', unsafe_allow_html=True)
-    c_gex, c_gex_info = st.columns([3, 1])
-    with c_gex:
-        fig_gex = chart_gex(gex_df, spot)
-        if fig_gex:
-            st.plotly_chart(fig_gex, use_container_width=True)
-    with c_gex_info:
-        gex_sign = "LONG" if (total_gex or 0) >= 0 else "SHORT"
-        gex_badge = "badge-green" if gex_sign == "LONG" else "badge-red"
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown(f'<span class="badge {gex_badge}">{gex_sign} GAMMA</span>', unsafe_allow_html=True)
-        st.markdown(f"""
-        <div style="margin-top:1rem;font-size:0.75rem;color:#505070;font-family:JetBrains Mono,monospace;line-height:1.8;">
-        <b style="color:#808090">¿Qué es el GEX?</b><br><br>
-        GEX = (OI_Call × Γ_Call − OI_Put × Γ_Put) × 100 × S²<br><br>
-        <span style="color:#22c55e">▲ GEX positivo</span><br>
-        Market makers están <i>long gamma</i>. Venden rallies y compran caídas → volatilidad comprimida.<br><br>
-        <span style="color:#f43f5e">▼ GEX negativo</span><br>
-        Market makers están <i>short gamma</i>. Amplifican los movimientos → mayor volatilidad.<br><br>
-        Las líneas punteadas naranjas indican puntos de <i>GEX flip</i> (gamma neutral).
-        </div>
-        """, unsafe_allow_html=True)
+    # ── GEX MODULE ────────────────────────────────────────────────────────────
+    st.markdown('<p class="bb-header">GAMMA EXPOSURE  ·  GEXBot-style</p>', unsafe_allow_html=True)
+    render_gex_module(calls_all, puts_all, calls, puts, spot)
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
