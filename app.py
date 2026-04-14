@@ -1132,7 +1132,7 @@ def main():
     if st.session_state.get("connected"):
         show_dashboard()
     else:
-        show_auth_screen()
+        show_connect_screen()
 
 
 if __name__ == "__main__":
