@@ -610,11 +610,11 @@ def fetch_quote(symbol):
     return {}
 
 
-def fetch_price_history(symbol: str, period: int = 1, period_type: str = "year") -> pd.DataFrame:
+def fetch_price_history(symbol: str, period: int = 1,
+                        period_type: str = "year") -> tuple[pd.DataFrame, str]:
     """
-    Fetch daily OHLCV price history from Schwab.
-    Returns DataFrame with columns: date, open, high, low, close, volume.
-    Returns empty DataFrame on failure.
+    Fetch daily OHLCV from Schwab.
+    Returns (DataFrame, error_message). error_message is "" on success.
     """
     try:
         r = api_get("/marketdata/v1/pricehistory", params={
@@ -623,20 +623,23 @@ def fetch_price_history(symbol: str, period: int = 1, period_type: str = "year")
             "period":        period,
             "frequencyType": "daily",
             "frequency":     1,
+            "needExtendedHoursData": "false",
         })
         if r.status_code != 200:
-            return pd.DataFrame()
+            return pd.DataFrame(), f"HTTP {r.status_code}: {r.text[:200]}"
         data = r.json()
+        if data.get("empty", False):
+            return pd.DataFrame(), f"Símbolo '{symbol}' no encontrado en Schwab."
         candles = data.get("candles", [])
         if not candles:
-            return pd.DataFrame()
+            return pd.DataFrame(), "La API devolvió 0 velas. Verifica el símbolo."
         df = pd.DataFrame(candles)
         df["date"] = pd.to_datetime(df["datetime"], unit="ms")
-        df = df[["date","open","high","low","close","volume"]].copy()
+        df = df[["date", "open", "high", "low", "close", "volume"]].copy()
         df = df.sort_values("date").reset_index(drop=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        return df, ""
+    except Exception as e:
+        return pd.DataFrame(), str(e)
 
 
 def parse_chain(data):
@@ -836,25 +839,28 @@ def calc_gex_by_expiry(c_all, p_all, spot):
     return pd.DataFrame(rows).sort_values("DTE")
 
 
-def calc_second_order_greeks(calls, puts, spot, r=_RF_RATE):
-    """Add Vanna and Charm columns using Black-Scholes."""
+def calc_second_order_greeks(calls: pd.DataFrame, puts: pd.DataFrame,
+                             spot: float, r: float = _RF_RATE):
+    """Add Vanna and Charm columns using Black-Scholes. Returns new DataFrames."""
+    result = []
     for df, opt_t in [(calls, "call"), (puts, "put")]:
-        if df.empty or not all(c in df.columns for c in ["Strike","IV%","DTE"]):
+        if df.empty or not all(c in df.columns for c in ["Strike", "IV%", "DTE"]):
+            result.append(df)
             continue
+        df_out = df.copy()
         vannas, charms = [], []
-        for _, row in df.iterrows():
-            K  = _sf(row.get("Strike", 0))
-            iv = _sf(row.get("IV%", 0)) / 100
-            T  = max(_sf(row.get("DTE", 0)) / 365, 1e-6)
+        for _, row in df_out.iterrows():
+            K    = _sf(row.get("Strike", 0))
+            iv   = _sf(row.get("IV%", 0)) / 100.0
+            dte_r = _sf(row.get("DTE", 0))
+            T    = max(float(np.asarray(dte_r).flat[0]) / 365.0, 1e-6)
             sign = -1 if opt_t == "put" else 1
-            v = bs_vanna(spot, K, T, iv, r)
-            c = bs_charm(spot, K, T, iv, r)
-            vannas.append(round(sign * v, 6))
-            charms.append(round(sign * c, 6))
-        df = df.copy()
-        df["Vanna"] = vannas
-        df["Charm"] = charms
-    return calls, puts
+            vannas.append(round(sign * bs_vanna(spot, K, T, iv, r), 6))
+            charms.append(round(sign * bs_charm(spot, K, T, iv, r), 6))
+        df_out["Vanna"] = vannas
+        df_out["Charm"] = charms
+        result.append(df_out)
+    return result[0], result[1]
 
 
 def calc_gex(c, p, spot):
@@ -864,34 +870,52 @@ def calc_gex(c, p, spot):
 
 
 def calc_iv_skew(c, p, spot):
-    """IV Skew: Put IV − Call IV at matched strikes, normalized by ATM IV."""
+    """
+    IV Skew: Put IV − Call IV at matched strikes.
+    Uses all-expiration data for a complete smile.
+    Groups by Strike and takes the nearest-expiry IV for each.
+    """
     if c.empty or p.empty or "IV%" not in c.columns:
         return pd.DataFrame()
-    c2 = c[["Strike","IV%"]].rename(columns={"IV%":"C_IV"})
-    p2 = p[["Strike","IV%"]].rename(columns={"IV%":"P_IV"})
-    skew = c2.merge(p2, on="Strike", how="inner")
+    # Use all expirations but prefer the shortest DTE (closest expiry)
+    # so the smile reflects near-term market sentiment
+    c_near = c.sort_values("DTE").groupby("Strike").first().reset_index()
+    p_near = p.sort_values("DTE").groupby("Strike").first().reset_index()
+    c2 = c_near[["Strike", "IV%"]].rename(columns={"IV%": "C_IV"})
+    p2 = p_near[["Strike", "IV%"]].rename(columns={"IV%": "P_IV"})
+    skew = c2.merge(p2, on="Strike", how="inner").dropna()
+    if skew.empty:
+        return pd.DataFrame()
     skew["Skew"] = skew["P_IV"] - skew["C_IV"]
     atm_idx = (skew["Strike"] - spot).abs().idxmin()
-    atm_iv  = (skew.loc[atm_idx,"C_IV"] + skew.loc[atm_idx,"P_IV"]) / 2
+    atm_iv  = (skew.loc[atm_idx, "C_IV"] + skew.loc[atm_idx, "P_IV"]) / 2
     skew["Moneyness"] = ((skew["Strike"] - spot) / spot * 100).round(2)
     if atm_iv > 0:
         skew["Skew_norm"] = (skew["Skew"] / atm_iv * 100).round(2)
     else:
         skew["Skew_norm"] = skew["Skew"]
-    return skew.sort_values("Strike")
+    return skew.sort_values("Strike").reset_index(drop=True)
 
 
 def calc_term_structure(c_all, spot):
-    """ATM IV per expiration → term structure."""
+    """ATM IV per expiration → term structure. Requires ≥1 expiration."""
     if c_all.empty or "IV%" not in c_all.columns:
         return pd.DataFrame()
     rows = []
     for exp, grp in c_all.groupby("Expiry"):
-        dte = int(grp["DTE"].iloc[0]) if "DTE" in grp.columns else 0
-        idx = (grp["Strike"] - spot).abs().idxmin()
-        atm_iv = grp.loc[idx, "IV%"]
-        rows.append({"Expiry": exp, "DTE": dte, "ATM_IV": atm_iv})
-    return pd.DataFrame(rows).sort_values("DTE")
+        grp_clean = grp.dropna(subset=["IV%", "Strike"])
+        if grp_clean.empty:
+            continue
+        try:
+            dte_val = int(float(np.asarray(grp_clean["DTE"].values[0]).flat[0])) \
+                      if "DTE" in grp_clean.columns else 0
+        except Exception:
+            dte_val = 0
+        idx    = (grp_clean["Strike"] - spot).abs().idxmin()
+        atm_iv = float(grp_clean.loc[idx, "IV%"])
+        if atm_iv > 0:
+            rows.append({"Expiry": exp, "DTE": dte_val, "ATM_IV": round(atm_iv, 2)})
+    return pd.DataFrame(rows).sort_values("DTE").reset_index(drop=True)
 
 
 def calc_charm(c, p, dte):
@@ -1836,6 +1860,119 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
     return fig
 
 
+def chart_candlestick_gex(price_df: pd.DataFrame, spot: float, gex_key: dict,
+                          mp: float = None, em_lo: float = None, em_hi: float = None,
+                          days_back: int = 60):
+    """
+    Candlestick chart with GEX structural levels overlaid:
+    - Spot price (live)
+    - Gamma Flip / HVL
+    - Call Wall
+    - Put Wall
+    - Max Pain
+    - Expected Move ±1σ band
+    """
+    if price_df.empty:
+        return None
+
+    df = price_df.tail(days_back).copy()
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.75, 0.25],
+        vertical_spacing=0.04,
+        subplot_titles=["PRECIO  +  GEX LEVELS", "VOLUMEN"],
+    )
+
+    # ── Candlesticks ──────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=df["date"],
+        open=df["open"], high=df["high"],
+        low=df["low"],   close=df["close"],
+        name="Precio",
+        increasing=dict(line=dict(color=_GREEN, width=1),
+                        fillcolor="rgba(34,197,94,0.6)"),
+        decreasing=dict(line=dict(color=_RED, width=1),
+                        fillcolor="rgba(244,63,94,0.6)"),
+        showlegend=False,
+    ), row=1, col=1)
+
+    # ── Volume bars ───────────────────────────────────────────────────────
+    vol_colors = [
+        "rgba(34,197,94,0.5)" if c >= o else "rgba(244,63,94,0.5)"
+        for o, c in zip(df["open"], df["close"])
+    ]
+    fig.add_trace(go.Bar(
+        x=df["date"], y=df["volume"],
+        marker_color=vol_colors, marker_line_width=0,
+        name="Volumen", showlegend=False,
+    ), row=2, col=1)
+
+    x_start = df["date"].iloc[0]
+    x_end   = df["date"].iloc[-1]
+
+    def _hline_range(y, color, dash, width, label, row=1):
+        if y is None:
+            return
+        fig.add_shape(type="line",
+            x0=x_start, x1=x_end, y0=y, y1=y,
+            line=dict(color=color, width=width, dash=dash),
+            row=row, col=1,
+        )
+        fig.add_annotation(
+            x=x_end, y=y, text=f" {label}  ${y:.1f}",
+            showarrow=False, xanchor="left",
+            font=dict(size=9, color=color, family=_FONT_MONO),
+            row=row, col=1,
+        )
+
+    # ── GEX levels ────────────────────────────────────────────────────────
+    cw = gex_key.get("call_wall")
+    pw = gex_key.get("put_wall")
+    gf = gex_key.get("gamma_flip")
+
+    _hline_range(cw, _GREEN,  "dash",    1.2, "CALL WALL")
+    _hline_range(pw, _RED,    "dash",    1.2, "PUT WALL")
+    _hline_range(gf, "#a855f7", "dot",   1.5, "HVL/FLIP")
+    _hline_range(spot, _ORANGE, "solid", 1.8, "SPOT")
+
+    # Max Pain
+    if mp:
+        _hline_range(mp, "#64748b", "dashdot", 1.0, "MAX PAIN")
+
+    # ── Expected Move band ────────────────────────────────────────────────
+    if em_lo and em_hi:
+        fig.add_hrect(
+            y0=em_lo, y1=em_hi,
+            fillcolor="rgba(168,85,247,0.05)",
+            line=dict(color="rgba(168,85,247,0.25)", width=0.5),
+            row=1, col=1,
+        )
+
+    fig.update_layout(
+        height=520,
+        xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=False,
+        title=dict(
+            text=f"  {days_back}d  ·  CALL WALL ${cw:.0f}  ·  PUT WALL ${pw:.0f}  ·  "
+                 f"HVL ${gf:.0f}" if all(x is not None for x in [cw, pw, gf]) else "  CANDLESTICK + GEX LEVELS",
+            font=dict(size=11, color="#606080", family=_FONT_MONO), x=0,
+        ),
+        **_BASE,
+    )
+    fig.update_xaxes(
+        **_AX_NOZERO,
+        tickformat="%b %d",
+        tickangle=-30,
+    )
+    fig.update_yaxes(**_AX_NOZERO, title_text="Precio", row=1, col=1)
+    fig.update_yaxes(**_AX_NOZERO, title_text="Vol",    row=2, col=1)
+    for ann in fig.layout.annotations:
+        ann.font.update(size=10, color="#606080", family=_FONT_MONO)
+    return fig
+
+
 def chart_iv_skew(skew_df, spot):
     if skew_df.empty:
         return None
@@ -1872,26 +2009,28 @@ def chart_iv_skew(skew_df, spot):
 
 
 def chart_term_structure(ts_df):
-    if ts_df.empty or len(ts_df) < 2:
+    if ts_df.empty:
         return None
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=ts_df["DTE"], y=ts_df["ATM_IV"],
         mode="lines+markers",
         line=dict(color=_ORANGE, width=2.5),
-        marker=dict(size=7, color=_ORANGE, line=dict(width=1, color="#0b0b14")),
-        hovertemplate="DTE: %{x}<br>ATM IV: %{y:.1f}%<extra></extra>",
-        fill="tozeroy", fillcolor="rgba(249,115,22,0.06)",
+        marker=dict(size=8, color=_ORANGE, line=dict(width=1.5, color="#0b0b14")),
+        hovertemplate="DTE: %{x}d<br>ATM IV: %{y:.1f}%<extra></extra>",
+        fill="tozeroy", fillcolor="rgba(249,115,22,0.05)",
     ))
-    # Annotate each point
     for _, row in ts_df.iterrows():
-        fig.add_annotation(x=row["DTE"], y=row["ATM_IV"],
-                           text=f"  {row['Expiry'][:10]}",
-                           showarrow=False, font=dict(size=9, color="#505070", family=_FONT_MONO),
-                           xanchor="left")
+        fig.add_annotation(
+            x=row["DTE"], y=row["ATM_IV"],
+            text=f"  {str(row['Expiry'])[:10]}",
+            showarrow=False,
+            font=dict(size=9, color="#505070", family=_FONT_MONO),
+            xanchor="left",
+        )
     fig.update_layout(
-        height=280,
-        xaxis_title="DTE (días a expiración)",
+        height=260,
+        xaxis_title="DTE (días)",
         yaxis_title="ATM IV (%)",
         **_BASE,
     )
@@ -2062,7 +2201,8 @@ def show_dashboard():
     em_lo, em_hi = calc_expected_move(spot, iv_atm, dte_v)
     _, gex_key  = calc_gex_advanced(calls_all, puts_all, spot)
     total_gex   = gex_key.get("total_gex_bn")
-    skew_df = calc_iv_skew(calls, puts, spot)
+    # Use ALL expirations for skew and term structure — richer data
+    skew_df = calc_iv_skew(calls_all, puts_all, spot)
     ts_df   = calc_term_structure(calls_all, spot)
     dex_data = calc_dex_advanced(calls_all, puts_all, spot)
     last_refresh = st.session_state.get("last_refresh", datetime.datetime.now())
@@ -2070,10 +2210,11 @@ def show_dashboard():
     # ── Price history (cached per symbol per day) ─────────────────────────────
     ph_key = f"ph_{symbol}_{today}"
     if ph_key not in st.session_state:
-        # Silently fetch — don't block the rest of the UI
-        ph_df = fetch_price_history(symbol)
-        st.session_state[ph_key] = ph_df
+        ph_df, ph_err = fetch_price_history(symbol)
+        st.session_state[ph_key]      = ph_df
+        st.session_state[ph_key+"_err"] = ph_err
     price_df = st.session_state.get(ph_key, pd.DataFrame())
+    price_err = st.session_state.get(ph_key + "_err", "")
 
     # ── Metrics row ──────────────────────────────────────────────────────────
     chg_color  = "#22c55e" if chg >= 0 else "#f43f5e"
@@ -2127,33 +2268,94 @@ def show_dashboard():
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
+    # ── CANDLESTICK + GEX LEVELS ──────────────────────────────────────────────
+    st.markdown('<p class="bb-header">PRECIO  ·  CANDLESTICK  +  ZONAS GEX</p>',
+                unsafe_allow_html=True)
+    if not price_df.empty:
+        c_cand, c_cand_ctrl = st.columns([4, 1])
+        with c_cand_ctrl:
+            st.markdown("<br>", unsafe_allow_html=True)
+            days_back = st.select_slider(
+                "Velas", options=[20, 40, 60, 90, 120, 180],
+                value=60, key="candle_days",
+            )
+            cw = gex_key.get("call_wall")
+            pw = gex_key.get("put_wall")
+            gf = gex_key.get("gamma_flip")
+            _lvl = lambda lbl, val, clr: st.markdown(
+                f'<div style="font-size:0.68rem;font-family:{_FONT_MONO};'
+                f'margin:4px 0;color:{clr}">{lbl}: '
+                f'<b>${val:.1f}</b></div>' if val else "", unsafe_allow_html=True)
+            _lvl("CALL WALL", cw, _GREEN)
+            _lvl("PUT WALL",  pw, _RED)
+            _lvl("HVL/FLIP",  gf, "#a855f7")
+            _lvl("MAX PAIN",  mp, "#64748b")
+            if em_lo and em_hi:
+                st.markdown(
+                    f'<div style="font-size:0.68rem;font-family:{_FONT_MONO};'
+                    f'margin:4px 0;color:#a855f7">EM: '
+                    f'<b>${em_lo:.0f}–${em_hi:.0f}</b></div>',
+                    unsafe_allow_html=True,
+                )
+        with c_cand:
+            fig_cand = chart_candlestick_gex(
+                price_df, spot, gex_key, mp, em_lo, em_hi, days_back=days_back)
+            if fig_cand:
+                st.plotly_chart(fig_cand, use_container_width=True)
+    else:
+        st.caption(
+            f"Historial de precios no disponible. "
+            + (f"Error: `{price_err}`" if price_err else
+               "Intenta recargar o verifica que el símbolo sea válido en Schwab.")
+        )
+
+    st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
+
     # ── IV Skew ───────────────────────────────────────────────────────────────
     st.markdown('<p class="bb-header">IV SKEW  &  VOLATILITY SMILE</p>', unsafe_allow_html=True)
-    fig_skew = chart_iv_skew(skew_df, spot)
-    if fig_skew:
-        st.plotly_chart(fig_skew, use_container_width=True)
+    if not skew_df.empty:
+        fig_skew = chart_iv_skew(skew_df, spot)
+        if fig_skew:
+            st.plotly_chart(fig_skew, use_container_width=True)
+        else:
+            st.caption("IV Skew: no se pudo generar la gráfica.")
+    else:
+        st.caption(
+            "IV Skew no disponible — requiere que calls y puts compartan strikes. "
+            "Intenta aumentar el número de strikes en el selector superior."
+        )
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
     # ── Term Structure ────────────────────────────────────────────────────────
-    st.markdown('<p class="bb-header">TERM STRUCTURE  (IV por vencimiento)</p>', unsafe_allow_html=True)
-    c_ts, c_ts_tbl = st.columns([3, 1])
-    with c_ts:
-        fig_ts = chart_term_structure(ts_df)
-        if fig_ts:
-            st.plotly_chart(fig_ts, use_container_width=True)
-        else:
-            st.caption("Necesitas más de 1 vencimiento disponible.")
-    with c_ts_tbl:
-        if not ts_df.empty:
+    st.markdown('<p class="bb-header">TERM STRUCTURE  (IV por vencimiento)</p>',
+                unsafe_allow_html=True)
+    if not ts_df.empty:
+        c_ts, c_ts_tbl = st.columns([3, 1])
+        with c_ts:
+            fig_ts = chart_term_structure(ts_df)
+            if fig_ts:
+                st.plotly_chart(fig_ts, use_container_width=True)
+        with c_ts_tbl:
             st.markdown("<br>", unsafe_allow_html=True)
-            tbl_html = '<table style="font-family:JetBrains Mono,monospace;font-size:0.72rem;width:100%;">'
-            tbl_html += '<tr><th style="color:#505070;text-align:left">Exp</th><th style="color:#505070;text-align:right">DTE</th><th style="color:#505070;text-align:right">ATM IV</th></tr>'
+            tbl = '<table style="font-family:JetBrains Mono,monospace;font-size:0.72rem;width:100%;">'
+            tbl += ('<tr><th style="color:#505070;text-align:left;padding:2px 6px">Exp</th>'
+                    '<th style="color:#505070;text-align:right;padding:2px 6px">DTE</th>'
+                    '<th style="color:#505070;text-align:right;padding:2px 6px">ATM IV</th></tr>')
             for _, row in ts_df.iterrows():
-                iv_c = _GREEN if row["ATM_IV"] < 30 else (_RED if row["ATM_IV"] > 60 else _ORANGE)
-                tbl_html += f'<tr><td style="color:#7070a0">{row["Expiry"][:10]}</td><td style="text-align:right;color:#9090b0">{int(row["DTE"])}</td><td style="text-align:right;color:{iv_c}">{row["ATM_IV"]:.1f}%</td></tr>'
-            tbl_html += "</table>"
-            st.markdown(tbl_html, unsafe_allow_html=True)
+                iv_c = (_GREEN if row["ATM_IV"] < 30 else
+                        (_RED if row["ATM_IV"] > 60 else _ORANGE))
+                tbl += (f'<tr>'
+                        f'<td style="color:#7070a0;padding:2px 6px">{str(row["Expiry"])[:10]}</td>'
+                        f'<td style="text-align:right;color:#9090b0;padding:2px 6px">{int(row["DTE"])}</td>'
+                        f'<td style="text-align:right;color:{iv_c};padding:2px 6px">{row["ATM_IV"]:.1f}%</td>'
+                        f'</tr>')
+            tbl += "</table>"
+            st.markdown(tbl, unsafe_allow_html=True)
+    else:
+        st.caption(
+            "Term Structure no disponible — requiere al menos 1 vencimiento con IV válido."
+        )
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
@@ -2163,23 +2365,31 @@ def show_dashboard():
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
-    # ── DELTA EXPOSURE (DEX) — Tier 2 ────────────────────────────────────────
-    st.markdown('<p class="bb-header">DELTA EXPOSURE  (DEX)  ·  Tier 2</p>', unsafe_allow_html=True)
+    # ── DELTA EXPOSURE (DEX) ──────────────────────────────────────────────────
+    st.markdown('<p class="bb-header">DELTA EXPOSURE  (DEX)</p>', unsafe_allow_html=True)
     st.caption(
-        "DEX = OI × Delta × 100 × Spot. Mide el sesgo direccional neto del mercado de opciones. "
-        "Call-heavy = soporte implícito de hedging debajo del spot. "
-        "Put-heavy = resistencia implícita de hedging encima del spot."
+        "DEX = OI × Δ × 100 × Spot. Sesgo direccional del mercado de opciones. "
+        "Call-heavy → soporte implícito de hedging bajo el spot. "
+        "Put-heavy → resistencia implícita sobre el spot."
     )
     fig_dex = chart_dex(dex_data, spot)
     if fig_dex:
         st.plotly_chart(fig_dex, use_container_width=True)
+    else:
+        st.caption("DEX: requiere columnas OI y Delta en la cadena.")
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
-    # ── VOLATILITY ANALYSIS — Tier 2 ─────────────────────────────────────────
+    # ── VOLATILITY ANALYSIS ───────────────────────────────────────────────────
     st.markdown('<p class="bb-header">VOLATILITY ANALYSIS  ·  HV · IV Rank · Cone · Returns</p>',
                 unsafe_allow_html=True)
-    render_vol_module(symbol, iv_atm, spot, price_df)
+    if not price_df.empty:
+        render_vol_module(symbol, iv_atm, spot, price_df)
+    else:
+        st.caption(
+            f"Análisis de volatilidad no disponible — historial de precios requerido. "
+            + (f"Error: `{price_err}`" if price_err else "")
+        )
 
     # ── Footer ────────────────────────────────────────────────────────────────
     st.markdown(
