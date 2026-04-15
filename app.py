@@ -1304,7 +1304,7 @@ def chart_gex_ladder(gex_df, spot, key, iv_adj=0.0):
     gf = key.get("gamma_flip")
     if gf:
         fig.add_hline(y=gf, line_dash="dot", line_color="#a855f7", line_width=1.2,
-                      annotation_text=f"  HVL  ${gf:.0f}", annotation_font_size=9,
+                      annotation_text=f"  Gamma Flip  ${gf:.0f}", annotation_font_size=9,
                       annotation_font_color="#a855f7", annotation_position="bottom right")
 
     # Call Wall
@@ -1367,7 +1367,7 @@ def chart_gex_cumulative(gex_df, spot, key):
     gf = key.get("gamma_flip")
     if gf:
         fig.add_vline(x=gf, line_dash="dot", line_color="#a855f7", line_width=1.2,
-                      annotation_text=f"  HVL ${gf:.0f}", annotation_font_size=9,
+                      annotation_text=f"  Gamma Flip ${gf:.0f}", annotation_font_size=9,
                       annotation_font_color="#a855f7")
     fig.update_layout(height=240, xaxis_title="Strike", yaxis_title="Cum GEX ($B)", **_BASE)
     fig.update_xaxes(**_AX_NOZERO)
@@ -1459,10 +1459,10 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     hdr += _kv("Régimen", f"{regime} Γ", r_color)
     hdr += _kv("Net GEX", f"${gex_sign}{total_bn:.2f}B", r_color)
     hdr += _kv("GEX / 1% move", f"${key.get('gex_per_1pct_mn',0):.0f}M")
-    hdr += _kv("HVL / Gamma Flip", f"${gf:.0f}" if gf else "—", "#a855f7")
+    hdr += _kv("Gamma Flip", f"${gf:.0f}" if gf else "—", "#a855f7")
     if gf and zp is not None:
         sign = "▲" if zp > 0 else "▼"
-        hdr += _kv("Spot → HVL", f"{sign} {abs(zp):.1f}%",
+        hdr += _kv("Spot → Gamma Flip", f"{sign} {abs(zp):.1f}%",
                    _GREEN if zp > 0 else _RED)
     hdr += _kv("Call Wall", f"${cw:.0f}" if cw else "—", _GREEN)
     hdr += _kv("Put Wall",  f"${pw:.0f}" if pw else "—", _RED)
@@ -1473,12 +1473,12 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     if regime == "POSITIVE":
         msg = ("🟢 <b>Long Gamma (estabilizador)</b> — Los MMs venden rallies y compran "
                "caídas. Espera rangos más estrechos y comportamiento <i>mean-reverting</i>. "
-               f"El spot debe superar el HVL (<b>${gf:.0f}</b>) para cambiar de régimen." if gf else
+               f"El spot debe superar el Gamma Flip (<b>${gf:.0f}</b>) para cambiar de régimen." if gf else
                "🟢 <b>Long Gamma</b> — régimen estabilizador.")
     elif regime == "NEGATIVE":
         msg = ("🔴 <b>Short Gamma (amplificador)</b> — Los MMs compran rallies y venden "
                "caídas. Los movimientos tienden a <i>acelerarse</i>. "
-               f"Vigilar el HVL en <b>${gf:.0f}</b> como pivote de régimen." if gf else
+               f"Vigilar el Gamma Flip en <b>${gf:.0f}</b> como pivote de régimen." if gf else
                "🔴 <b>Short Gamma</b> — régimen amplificador.")
     else:
         msg = "🟡 <b>Gamma Neutral / Transitional</b> — mercado en equilibrio cerca del flip point."
@@ -1500,7 +1500,7 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     with col_l:
         st.markdown('<p class="bb-header" style="margin-top:0.3rem">GEX LADDER  (todos los vencimientos)</p>',
                     unsafe_allow_html=True)
-        st.caption("Calls → derecha (verde) · Puts → izquierda (rojo) · HVL = Gamma Flip")
+        st.caption("Calls → derecha (verde) · Puts → izquierda (rojo) · Gamma Flip")
         fig_lad = chart_gex_ladder(gex_df, spot, key, iv_adj)
         if fig_lad: st.plotly_chart(fig_lad, use_container_width=True)
 
@@ -1516,7 +1516,7 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     # ── Cumulative profile ─────────────────────────────────────────────────
     st.markdown('<p class="bb-header">PERFIL ACUMULADO</p>', unsafe_allow_html=True)
     st.caption("Suma acumulada de GEX desde el strike más bajo al más alto. "
-               "El cruce por cero = Gamma Flip / HVL — donde el régimen cambia.")
+               "El cruce por cero = Gamma Flip — donde el régimen cambia.")
     fig_cum = chart_gex_cumulative(gex_df, spot, key)
     if fig_cum: st.plotly_chart(fig_cum, use_container_width=True)
 
@@ -1924,47 +1924,25 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
 
 def _to_cdmx_naive(dates: pd.Series) -> pd.Series:
     """
-    Convert UTC timestamps → CDMX local time as TIMEZONE-NAIVE strings.
-    Critical: must strip tz info AFTER converting, otherwise Plotly
-    silently reconverts aware timestamps back to UTC for display.
+    UTC → CDMX naive (strips tz so Plotly/lightweight-charts won't reconvert to UTC).
     """
     try:
         if dates.dt.tz is None:
             aware = dates.dt.tz_localize("UTC").dt.tz_convert(_CDMX_TZ)
         else:
             aware = dates.dt.tz_convert(_CDMX_TZ)
-        # Strip timezone — Plotly will use the face value as-is ✅
         return aware.dt.tz_localize(None)
     except Exception:
         return dates
-
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    return 100 - (100 / (1 + gain / (loss + 1e-10)))
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    return (tp * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-10)
 
 
 def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
                     mp: float = None, em_lo: float = None, em_hi: float = None,
                     freq_min: int = 1):
     """
-    TradingView-style chart using lightweight-charts JS (open-source from TradingView).
-    Rendered via st.components.v1.html() — fully interactive:
-    - Scroll, zoom (mouse wheel + pinch), crosshair
-    - CDMX timezone (naive local timestamps)
-    - Candlestick + Volume + EMA 9/21/50 + VWAP + RSI
-    - GEX structural levels as horizontal price lines
+    Candlestick + Volume + GEX structural zones via lightweight-charts.
+    NO technical indicators — only price action + GEX levels.
+    Time displayed in CDMX (UTC-6).
     """
     import json
     import streamlit.components.v1 as components
@@ -1974,308 +1952,195 @@ def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
         return
 
     df = price_df.copy()
-
-    # ── Timezone → CDMX naive ─────────────────────────────────────────────
     df["date_local"] = _to_cdmx_naive(df["date"])
+    df = df.dropna(subset=["open", "high", "low", "close"])
 
-    # ── Technical indicators ──────────────────────────────────────────────
-    df["ema9"]  = _ema(df["close"], 9).round(4)
-    df["ema21"] = _ema(df["close"], 21).round(4)
-    df["ema50"] = _ema(df["close"], 50).round(4)
-    df["rsi"]   = _rsi(df["close"], 14).round(2)
-    df["vwap"]  = _vwap(df).round(4)
-    df = df.dropna(subset=["open","high","low","close"])
+    # lightweight-charts intraday: use Unix seconds (face-value local time)
+    # Convert naive local datetime → Unix seconds treating it AS IF it were UTC
+    # (this is intentional: we want the chart to display the CDMX time on the axis)
+    def to_unix_local(dt_naive):
+        import calendar
+        return int(calendar.timegm(dt_naive.timetuple()))
 
-    # ── Serialize to lightweight-charts format ────────────────────────────
-    # lightweight-charts wants: {time: "YYYY-MM-DDTHH:MM:SS", open, high, low, close}
-    def to_lw_candles(df):
-        return [
-            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
-             "open": float(row["open"]), "high": float(row["high"]),
-             "low":  float(row["low"]),  "close": float(row["close"])}
-            for _, row in df.iterrows()
-        ]
+    candles = [
+        {
+            "time": to_unix_local(row["date_local"].to_pydatetime()),
+            "open":  round(float(row["open"]),  4),
+            "high":  round(float(row["high"]),  4),
+            "low":   round(float(row["low"]),   4),
+            "close": round(float(row["close"]), 4),
+        }
+        for _, row in df.iterrows()
+    ]
 
-    def to_lw_line(df, col):
-        return [
-            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
-             "value": float(row[col])}
-            for _, row in df[df[col].notna()].iterrows()
-        ]
+    volumes = [
+        {
+            "time":  to_unix_local(row["date_local"].to_pydatetime()),
+            "value": float(row["volume"]),
+            "color": "#26a69a88" if row["close"] >= row["open"] else "#ef535088",
+        }
+        for _, row in df.iterrows()
+    ]
 
-    def to_lw_volume(df):
-        return [
-            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
-             "value": float(row["volume"]),
-             "color": "#26a69a" if row["close"] >= row["open"] else "#ef5350"}
-            for _, row in df.iterrows()
-        ]
-
-    def to_lw_rsi(df):
-        return [
-            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
-             "value": float(row["rsi"])}
-            for _, row in df[df["rsi"].notna()].iterrows()
-        ]
-
-    candles = json.dumps(to_lw_candles(df))
-    volumes = json.dumps(to_lw_volume(df))
-    ema9    = json.dumps(to_lw_line(df, "ema9"))
-    ema21   = json.dumps(to_lw_line(df, "ema21"))
-    ema50   = json.dumps(to_lw_line(df, "ema50"))
-    vwap    = json.dumps(to_lw_line(df, "vwap"))
-    rsi_data= json.dumps(to_lw_rsi(df))
-
-    # GEX level lines
+    # GEX levels
     cw = gex_key.get("call_wall")
     pw = gex_key.get("put_wall")
-    gf = gex_key.get("gamma_flip")
+    gf = gex_key.get("gamma_flip")   # renamed to "Gamma Flip"
 
-    def price_line(price, color, title, style=0):
-        # style: 0=solid, 1=dotted, 2=dashed, 3=large dashed, 4=sparse dotted
+    def pline(price, color, title, style=0, width=1):
         if price is None or price <= 0:
-            return "null"
-        return json.dumps({"price": float(price), "color": color,
-                            "lineWidth": 1, "lineStyle": style,
-                            "axisLabelVisible": True, "title": title})
+            return None
+        return {"price": float(price), "color": color,
+                "lineWidth": width, "lineStyle": style,
+                "axisLabelVisible": True, "title": title}
 
-    gex_lines = {
-        "spot":      price_line(spot,  "#f97316", f"● {spot:.2f}", 0),
-        "call_wall": price_line(cw,    "#22c55e", f"CW {cw:.0f}" if cw else "", 2),
-        "put_wall":  price_line(pw,    "#ef4444", f"PW {pw:.0f}" if pw else "", 2),
-        "hvl":       price_line(gf,    "#a855f7", f"HVL {gf:.0f}" if gf else "", 1),
-        "max_pain":  price_line(mp,    "#94a3b8", f"MP {mp:.0f}" if mp else "", 4),
-        "em_hi":     price_line(em_hi, "#a855f780", f"EM+ {em_hi:.0f}" if em_hi else "", 4),
-        "em_lo":     price_line(em_lo, "#a855f780", f"EM- {em_lo:.0f}" if em_lo else "", 4),
-    }
+    gex_lines = [l for l in [
+        pline(spot,  "#f97316", f"SPOT  {spot:.2f}",              0, 2),
+        pline(cw,    "#22c55e", f"CALL WALL  {cw:.1f}" if cw else "", 2, 1),
+        pline(pw,    "#ef4444", f"PUT WALL  {pw:.1f}"  if pw else "", 2, 1),
+        pline(gf,    "#a855f7", f"GAMMA FLIP  {gf:.1f}" if gf else "", 1, 1),
+        pline(mp,    "#94a3b8", f"MAX PAIN  {mp:.1f}"  if mp else "", 4, 1),
+        pline(em_hi, "#a855f750", f"EM+  {em_hi:.1f}"  if em_hi else "", 3, 1),
+        pline(em_lo, "#a855f750", f"EM-  {em_lo:.1f}"  if em_lo else "", 3, 1),
+    ] if l is not None]
 
-    now_cdmx = datetime.datetime.now(_CDMX_TZ)
     freq_label = f"{freq_min}m" if freq_min < 60 else f"{freq_min//60}h"
+    now_cdmx   = datetime.datetime.now(_CDMX_TZ)
+    last_close = float(df["close"].iloc[-1]) if not df.empty else spot
+    chg        = last_close - float(df["open"].iloc[0]) if not df.empty else 0
+    chg_pct    = chg / float(df["open"].iloc[0]) * 100 if df["open"].iloc[0] != 0 else 0
+    chg_clr    = "#26a69a" if chg >= 0 else "#ef5350"
 
-    html = f"""
-<!DOCTYPE html>
+    chips = ""
+    if cw:  chips += f'<span class="chip chip-g">CALL WALL {cw:.0f}</span>'
+    if pw:  chips += f'<span class="chip chip-r">PUT WALL {pw:.0f}</span>'
+    if gf:  chips += f'<span class="chip chip-p">GAMMA FLIP {gf:.0f}</span>'
+    if mp:  chips += f'<span class="chip chip-s">MAX PAIN {mp:.0f}</span>'
+
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ background:#131722; color:#d1d4dc; font-family:'JetBrains Mono',monospace; }}
-  #header {{
-    display:flex; align-items:center; gap:16px; padding:8px 12px;
-    background:#1e222d; border-bottom:1px solid #2a2e39; font-size:11px;
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{background:#131722;color:#d1d4dc;font-family:'Courier New',monospace;overflow:hidden}}
+  #hdr{{
+    display:flex;align-items:center;gap:10px;padding:7px 14px;
+    background:#1e222d;border-bottom:1px solid #2a2e39;flex-wrap:wrap;
   }}
-  #sym {{ font-weight:700; font-size:13px; color:#d1d4dc; }}
-  .hchip {{ padding:2px 8px; border-radius:3px; font-size:10px; font-weight:600; }}
-  .chip-green {{ background:rgba(38,166,154,.18); color:#26a69a; }}
-  .chip-red   {{ background:rgba(239,83,80,.18);  color:#ef5350; }}
-  .chip-orange{{ background:rgba(249,115,22,.18); color:#f97316; }}
-  .chip-purple{{ background:rgba(168,85,247,.18); color:#a855f7; }}
-  .chip-gray  {{ background:rgba(148,163,184,.12);color:#94a3b8; }}
-  #tz-label {{ margin-left:auto; color:#787b86; font-size:10px; }}
-  #legend {{
-    display:flex; gap:10px; padding:4px 12px;
-    background:#1e222d; border-bottom:1px solid #2a2e39; font-size:10px;
+  #price{{font-weight:700;font-size:15px;color:#d1d4dc;letter-spacing:.03em}}
+  #chg{{font-size:11px;color:{chg_clr};font-weight:600}}
+  .chip{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;letter-spacing:.04em}}
+  .chip-g{{background:rgba(38,166,154,.15);color:#26a69a}}
+  .chip-r{{background:rgba(239,83,80,.15);color:#ef5350}}
+  .chip-p{{background:rgba(168,85,247,.15);color:#a855f7}}
+  .chip-s{{background:rgba(148,163,184,.12);color:#94a3b8}}
+  .chip-o{{background:rgba(249,115,22,.15);color:#f97316}}
+  #tz{{margin-left:auto;font-size:10px;color:#535964}}
+  #chart{{width:100%;height:460px}}
+  #vol{{width:100%;height:80px}}
+  #ohlc{{
+    position:absolute;top:54px;left:14px;font-size:10px;
+    color:#9598a1;pointer-events:none;z-index:5;
+    background:rgba(19,23,34,.7);padding:3px 8px;border-radius:3px;
+    display:none;
   }}
-  .leg {{ display:flex; align-items:center; gap:4px; color:#787b86; }}
-  .leg-dot {{ width:8px; height:2px; border-radius:1px; }}
-  #chart-container {{ position:relative; width:100%; }}
-  #chart {{ width:100%; height:440px; }}
-  #rsi-chart {{ width:100%; height:100px; }}
-  #rsi-label {{
-    position:absolute; right:8px; font-size:9px; color:#787b86;
-    pointer-events:none;
-  }}
-  .ohlc-tooltip {{
-    position:absolute; top:8px; left:12px; font-size:10px;
-    color:#d1d4dc; pointer-events:none; z-index:10;
-    background:rgba(19,23,34,.85); padding:4px 8px; border-radius:4px;
-    border:1px solid #2a2e39; display:none;
-  }}
+  #wrap{{position:relative}}
 </style>
 </head>
 <body>
-
-<div id="header">
-  <span id="sym">⬛ {spot:.2f}</span>
-  <span class="hchip chip-orange">{freq_label}</span>
-  {"" if not cw else f'<span class="hchip chip-green">CW ${cw:.0f}</span>'}
-  {"" if not pw else f'<span class="hchip chip-red">PW ${pw:.0f}</span>'}
-  {"" if not gf else f'<span class="hchip chip-purple">HVL ${gf:.0f}</span>'}
-  {"" if not mp else f'<span class="hchip chip-gray">MP ${mp:.0f}</span>'}
-  <span id="tz-label">CDMX {now_cdmx.strftime('%H:%M:%S')} (UTC-6)</span>
+<div id="hdr">
+  <span id="price">{last_close:.2f}</span>
+  <span id="chg">{chg:+.2f} ({chg_pct:+.2f}%)</span>
+  <span class="chip chip-o">{freq_label}</span>
+  {chips}
+  <span id="tz">CDMX {now_cdmx.strftime('%H:%M:%S')}</span>
 </div>
-
-<div id="legend">
-  <div class="leg"><div class="leg-dot" style="background:#f59e0b"></div>EMA 9</div>
-  <div class="leg"><div class="leg-dot" style="background:#60a5fa"></div>EMA 21</div>
-  <div class="leg"><div class="leg-dot" style="background:#a78bfa"></div>EMA 50</div>
-  <div class="leg"><div class="leg-dot" style="background:#f97316;height:1px;border-top:1px dashed #f97316;width:12px"></div>VWAP</div>
-  <div class="leg"><span style="color:#787b86;font-size:9px">Scroll=pan · Ctrl+Scroll=zoom · Dbl-click=reset</span></div>
-</div>
-
-<div id="chart-container">
-  <div class="ohlc-tooltip" id="tooltip"></div>
+<div id="wrap">
+  <div id="ohlc"></div>
   <div id="chart"></div>
-  <div id="rsi-chart"></div>
+  <div id="vol"></div>
 </div>
-
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
-const CANDLES  = {candles};
-const VOLUMES  = {volumes};
-const EMA9     = {ema9};
-const EMA21    = {ema21};
-const EMA50    = {ema50};
-const VWAP     = {vwap};
-const RSI_DATA = {rsi_data};
+const CANDLES = {json.dumps(candles)};
+const VOLUMES = {json.dumps(volumes)};
+const GEX_LINES = {json.dumps(gex_lines)};
 
-const GEX = {{
-  spot:      {gex_lines['spot']},
-  call_wall: {gex_lines['call_wall']},
-  put_wall:  {gex_lines['put_wall']},
-  hvl:       {gex_lines['hvl']},
-  max_pain:  {gex_lines['max_pain']},
-  em_hi:     {gex_lines['em_hi']},
-  em_lo:     {gex_lines['em_lo']},
+const BASE = {{
+  layout:{{background:{{type:'solid',color:'#131722'}},textColor:'#535964',fontFamily:"'Courier New',monospace",fontSize:11}},
+  grid:{{vertLines:{{color:'rgba(42,46,57,0.5)',style:1}},horzLines:{{color:'rgba(42,46,57,0.5)',style:1}}}},
+  crosshair:{{mode:1,vertLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}},horzLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}}}},
+  rightPriceScale:{{borderColor:'#2a2e39',mode:0}},
+  timeScale:{{borderColor:'#2a2e39',timeVisible:true,secondsVisible:false}},
+  handleScroll:{{mouseWheel:true,pressedMouseMove:true}},
+  handleScale:{{mouseWheel:true,pinch:true,axisPressedMouseMove:true}},
 }};
 
-const TV_OPTS = {{
-  layout: {{
-    background: {{ type:'solid', color:'#131722' }},
-    textColor: '#787b86',
-    fontFamily: "'JetBrains Mono', monospace",
-    fontSize: 10,
-  }},
-  grid: {{
-    vertLines: {{ color:'rgba(42,46,57,0.6)', style:1 }},
-    horzLines: {{ color:'rgba(42,46,57,0.6)', style:1 }},
-  }},
-  crosshair: {{
-    mode: LightweightCharts.CrosshairMode.Normal,
-    vertLine: {{ color:'#758696', width:1, style:1, labelBackgroundColor:'#2a2e39' }},
-    horzLine: {{ color:'#758696', width:1, style:1, labelBackgroundColor:'#2a2e39' }},
-  }},
-  rightPriceScale: {{ borderColor:'#2a2e39' }},
-  timeScale: {{
-    borderColor: '#2a2e39',
-    timeVisible: true,
-    secondsVisible: false,
-    tickMarkFormatter: (time) => {{
-      const d = new Date(time * 1000);
-      return d.toLocaleTimeString('es-MX', {{hour:'2-digit', minute:'2-digit', hour12:false}});
-    }},
-  }},
-  handleScroll: {{ mouseWheel:true, pressedMouseMove:true, horzTouchDrag:true }},
-  handleScale: {{ mouseWheel:true, pinch:true, axisPressedMouseMove:true }},
-}};
+const W = document.getElementById('chart').offsetWidth;
 
-// ── Main price chart ──────────────────────────────────────────────────────
-const chart = LightweightCharts.createChart(document.getElementById('chart'), {{
-  ...TV_OPTS,
-  width:  document.getElementById('chart').offsetWidth,
-  height: 440,
+// ── Price chart ────────────────────────────────────────────────────────
+const chart = LightweightCharts.createChart(document.getElementById('chart'),
+  {{...BASE, width:W, height:460}});
+
+const cs = chart.addCandlestickSeries({{
+  upColor:'#26a69a', downColor:'#ef5350',
+  borderUpColor:'#26a69a', borderDownColor:'#ef5350',
+  wickUpColor:'#26a69a', wickDownColor:'#ef5350',
 }});
+cs.setData(CANDLES);
 
-const candleSeries = chart.addCandlestickSeries({{
-  upColor:   '#26a69a', downColor: '#ef5350',
-  borderUpColor: '#26a69a', borderDownColor: '#ef5350',
-  wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-}});
-candleSeries.setData(CANDLES);
+// GEX price lines
+GEX_LINES.forEach(l => cs.createPriceLine(l));
 
-// Volume as histogram overlay (scaled)
-const volSeries = chart.addHistogramSeries({{
-  priceFormat: {{ type:'volume' }},
-  priceScaleId: 'vol',
-  scaleMargins: {{ top:0.85, bottom:0 }},
-}});
-volSeries.setData(VOLUMES);
-chart.priceScale('vol').applyOptions({{ scaleMargins:{{top:0.85, bottom:0}} }});
-
-// EMAs
-const ema9s  = chart.addLineSeries({{ color:'#f59e0b', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
-const ema21s = chart.addLineSeries({{ color:'#60a5fa', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
-const ema50s = chart.addLineSeries({{ color:'#a78bfa', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
-ema9s.setData(EMA9); ema21s.setData(EMA21); ema50s.setData(EMA50);
-
-// VWAP
-const vwapS = chart.addLineSeries({{ color:'#f97316', lineWidth:1.5, lineStyle:1, lastValueVisible:true, priceLineVisible:false }});
-vwapS.setData(VWAP);
-
-// GEX price lines on candlestick series
-for (const [k, line] of Object.entries(GEX)) {{
-  if (line) candleSeries.createPriceLine(line);
-}}
-
-// ── RSI chart (linked x-axis) ──────────────────────────────────────────────
-const rsiChart = LightweightCharts.createChart(document.getElementById('rsi-chart'), {{
-  ...TV_OPTS,
-  width:  document.getElementById('rsi-chart').offsetWidth,
-  height: 100,
-  timeScale: {{ ...TV_OPTS.timeScale, visible:false }},
-}});
-
-const rsiSeries = rsiChart.addLineSeries({{
-  color:'#60a5fa', lineWidth:1.5, lastValueVisible:true, priceLineVisible:false,
-  autoscaleInfoProvider: () => ({{ priceRange: {{ minValue:0, maxValue:100 }} }}),
-}});
-rsiSeries.setData(RSI_DATA);
-
-// RSI bands
-[70, 50, 30].forEach((lvl, i) => {{
-  rsiSeries.createPriceLine({{
-    price: lvl,
-    color: i===0 ? 'rgba(239,83,80,0.4)' : i===2 ? 'rgba(38,166,154,0.4)' : 'rgba(255,255,255,0.15)',
-    lineWidth: 1, lineStyle: 1, axisLabelVisible: false,
+// ── Volume chart (shared x-axis) ────────────────────────────────────────
+const volChart = LightweightCharts.createChart(document.getElementById('vol'),
+  {{...BASE,
+    width:W, height:80,
+    timeScale:{{...BASE.timeScale, visible:false}},
+    rightPriceScale:{{visible:false}},
+    leftPriceScale:{{visible:false}},
   }});
-}});
 
-// ── Sync crosshair between charts ─────────────────────────────────────────
-function syncCrosshair(src, dst, param) {{
-  if (!param || !param.time) {{ dst.clearCrossHair(); return; }}
+const vs = volChart.addHistogramSeries({{
+  priceFormat:{{type:'volume'}},
+  priceScaleId:'vol',
+  lastValueVisible:false, priceLineVisible:false,
+}});
+vs.setData(VOLUMES);
+
+// ── Sync crosshair ─────────────────────────────────────────────────────
+function sync(src, dst, param){{
+  if(!param||!param.time){{dst.clearCrossHair();return;}}
   const x = src.timeScale().timeToCoordinate(param.time);
-  dst.setCrossHairXY(x, 200, true);
+  dst.setCrossHairXY(x,0,true);
 }}
-chart.subscribeCrosshairMove(p => syncCrosshair(chart, rsiChart, p));
-rsiChart.subscribeCrosshairMove(p => syncCrosshair(rsiChart, chart, p));
+chart.subscribeCrosshairMove(p=>sync(chart,volChart,p));
+volChart.subscribeCrosshairMove(p=>sync(volChart,chart,p));
 
-// ── OHLC tooltip ──────────────────────────────────────────────────────────
-const tooltip = document.getElementById('tooltip');
-chart.subscribeCrosshairMove(param => {{
-  if (!param.time || !param.seriesData.has(candleSeries)) {{
-    tooltip.style.display = 'none'; return;
-  }}
-  const c = param.seriesData.get(candleSeries);
-  const rsi = RSI_DATA.findLast(r => r.time <= param.time);
-  const chg = c.close - c.open;
-  const chgP = (chg / c.open * 100).toFixed(2);
-  const clr = chg >= 0 ? '#26a69a' : '#ef5350';
-  tooltip.style.display = 'block';
-  tooltip.innerHTML = `
-    <span style="color:${{clr}};font-weight:700">
-    O:${{c.open.toFixed(2)}} H:${{c.high.toFixed(2)}} L:${{c.low.toFixed(2)}} C:${{c.close.toFixed(2)}}
-    ${{chg>=0?'+':''}}${{chg.toFixed(2)}} (${{chg>=0?'+':''}}${{chgP}}%)
-    </span>
-    ${{rsi ? ` &nbsp;|&nbsp; RSI:${{rsi.value.toFixed(1)}}` : ''}}
-  `;
+// ── OHLC tooltip ───────────────────────────────────────────────────────
+const tip = document.getElementById('ohlc');
+chart.subscribeCrosshairMove(p=>{{
+  if(!p.time||!p.seriesData.has(cs)){{tip.style.display='none';return;}}
+  const c=p.seriesData.get(cs);
+  const chg=c.close-c.open, chgP=(chg/c.open*100).toFixed(2);
+  const clr=chg>=0?'#26a69a':'#ef5350';
+  tip.style.display='block';
+  tip.innerHTML=`<span style="color:${{clr}}">O:${{c.open.toFixed(2)}} H:${{c.high.toFixed(2)}} L:${{c.low.toFixed(2)}} C:${{c.close.toFixed(2)}} <b>${{chg>=0?'+':''}}${{chg.toFixed(2)}} (${{chgP}}%)</b></span>`;
 }});
 
-// ── Resize handler ────────────────────────────────────────────────────────
-function resize() {{
-  const w = document.getElementById('chart-container').offsetWidth;
-  chart.applyOptions({{ width: w }});
-  rsiChart.applyOptions({{ width: w }});
-}}
-window.addEventListener('resize', resize);
-resize();
-
-// Auto-scroll to latest candle
+// ── Resize ─────────────────────────────────────────────────────────────
+window.addEventListener('resize',()=>{{
+  const w=document.getElementById('wrap').offsetWidth;
+  chart.applyOptions({{width:w}});
+  volChart.applyOptions({{width:w}});
+}});
 chart.timeScale().scrollToRealTime();
 </script>
 </body>
-</html>
-"""
-    components.html(html, height=590, scrolling=False)
+</html>"""
+
+    components.html(html, height=570, scrolling=False)
 
 
 
