@@ -8,10 +8,12 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests, base64, datetime, time, warnings
+import requests, base64, datetime, time, warnings, pytz
 from urllib.parse import urlencode, urlparse, parse_qs
 
 warnings.filterwarnings("ignore")
+
+_CDMX_TZ = pytz.timezone("America/Mexico_City")
 
 st.set_page_config(
     page_title="Options Terminal",
@@ -742,9 +744,18 @@ def calc_pcr(c, p):
 
 
 def calc_atm_iv(c, spot):
+    """ATM IV — uses nearest-strike call with valid IV. Tries all expirations."""
     if c.empty or "IV%" not in c.columns or spot == 0:
         return None
-    return float(c.loc[(c["Strike"] - spot).abs().idxmin(), "IV%"])
+    valid = c[c["IV%"].notna() & (c["IV%"] > 0.5)].copy()  # >0.5% = valid
+    if valid.empty:
+        return None
+    # Sort by DTE to prefer nearest expiry
+    if "DTE" in valid.columns:
+        valid = valid.sort_values("DTE")
+    idx = (valid["Strike"] - spot).abs().idxmin()
+    val = float(valid.loc[idx, "IV%"])
+    return val if val > 0.5 else None
 
 
 def calc_expected_move(spot, iv_pct, dte):
@@ -902,34 +913,36 @@ def calc_gex(c, p, spot):
 
 
 def calc_iv_skew(c, p, spot):
-    """
-    IV Skew across all expirations.
-    Uses nearest-DTE IV for each strike. Robust to NaN and type issues.
-    """
+    """IV Skew across all expirations. Filters invalid IV (zero or NaN)."""
     if c.empty or p.empty:
         return pd.DataFrame()
-    # Ensure IV% and Strike are numeric
-    for df in [c, p]:
-        if "IV%" not in df.columns or "Strike" not in df.columns:
-            return pd.DataFrame()
+    if "IV%" not in c.columns or "Strike" not in c.columns:
+        return pd.DataFrame()
 
-    c2 = c.copy()
-    p2 = p.copy()
-    c2["IV%"]    = pd.to_numeric(c2["IV%"],    errors="coerce")
-    c2["Strike"] = pd.to_numeric(c2["Strike"], errors="coerce")
-    c2["DTE"]    = pd.to_numeric(c2.get("DTE", 0), errors="coerce").fillna(0)
-    p2["IV%"]    = pd.to_numeric(p2["IV%"],    errors="coerce")
-    p2["Strike"] = pd.to_numeric(p2["Strike"], errors="coerce")
-    p2["DTE"]    = pd.to_numeric(p2.get("DTE", 0), errors="coerce").fillna(0)
+    c2 = c[["Strike","IV%"] + (["DTE"] if "DTE" in c.columns else [])].copy()
+    p2 = p[["Strike","IV%"] + (["DTE"] if "DTE" in p.columns else [])].copy()
 
-    c2 = c2.dropna(subset=["IV%", "Strike"])
-    p2 = p2.dropna(subset=["IV%", "Strike"])
+    for df in [c2, p2]:
+        df["IV%"]    = pd.to_numeric(df["IV%"],    errors="coerce")
+        df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
+        if "DTE" in df.columns:
+            df["DTE"] = pd.to_numeric(df["DTE"], errors="coerce").fillna(9999)
+
+    # Keep only valid IV rows (> 0.5% means it's real, not placeholder)
+    c2 = c2[c2["IV%"].notna() & (c2["IV%"] > 0.5)].dropna(subset=["Strike"])
+    p2 = p2[p2["IV%"].notna() & (p2["IV%"] > 0.5)].dropna(subset=["Strike"])
+
     if c2.empty or p2.empty:
         return pd.DataFrame()
 
-    # Pick nearest DTE per strike
-    c_near = c2.sort_values("DTE").groupby("Strike")["IV%"].first().reset_index()
-    p_near = p2.sort_values("DTE").groupby("Strike")["IV%"].first().reset_index()
+    # Nearest-DTE IV per strike
+    if "DTE" in c2.columns and "DTE" in p2.columns:
+        c_near = c2.sort_values("DTE").groupby("Strike")["IV%"].first().reset_index()
+        p_near = p2.sort_values("DTE").groupby("Strike")["IV%"].first().reset_index()
+    else:
+        c_near = c2.groupby("Strike")["IV%"].mean().reset_index()
+        p_near = p2.groupby("Strike")["IV%"].mean().reset_index()
+
     c_near.columns = ["Strike", "C_IV"]
     p_near.columns = ["Strike", "P_IV"]
 
@@ -1909,72 +1922,238 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
     return fig
 
 
+def _to_cdmx(dates: pd.Series) -> pd.Series:
+    """Convert UTC timestamps to CDMX time (America/Mexico_City)."""
+    try:
+        if dates.dt.tz is None:
+            return dates.dt.tz_localize("UTC").dt.tz_convert(_CDMX_TZ)
+        return dates.dt.tz_convert(_CDMX_TZ)
+    except Exception:
+        return dates
+
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / (loss + 1e-10)
+    return 100 - (100 / (1 + rs))
+
+
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    """Intraday VWAP (resets each day)."""
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    return (tp * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-10)
+
+
 def chart_candlestick_gex(price_df: pd.DataFrame, spot: float, gex_key: dict,
                           mp: float = None, em_lo: float = None, em_hi: float = None,
-                          days_back: int = None):
-    """Candlestick (intraday or daily) with GEX structural levels."""
+                          show_ema: bool = True, show_vwap: bool = True,
+                          show_rsi: bool = True, freq_min: int = 1):
+    """
+    Professional TradingView-style candlestick chart.
+    - CDMX timezone (America/Mexico_City)
+    - EMA 9, 21, 50
+    - VWAP (intraday only)
+    - RSI 14 subplot
+    - Volume color-coded bars
+    - GEX structural levels: Call Wall, Put Wall, HVL, Max Pain, EM band
+    """
     if price_df.empty:
         return None
-    df = price_df.copy() if days_back is None else price_df.tail(days_back).copy()
+
+    df = price_df.copy()
+
+    # ── Timezone conversion to CDMX ──────────────────────────────────────
+    df["date_cdmx"] = _to_cdmx(df["date"])
+
+    # ── Technical indicators ──────────────────────────────────────────────
+    df["ema9"]  = _ema(df["close"], 9)
+    df["ema21"] = _ema(df["close"], 21)
+    df["ema50"] = _ema(df["close"], 50)
+    df["rsi"]   = _rsi(df["close"], 14)
+    is_intraday = freq_min < 1440  # anything less than 1-day bars
+    if is_intraday:
+        df["vwap"] = _vwap(df)
+
+    # ── Subplots ──────────────────────────────────────────────────────────
+    rows       = 3 if show_rsi else 2
+    row_heights = [0.65, 0.18, 0.17] if show_rsi else [0.78, 0.22]
+    row_titles  = ["", "", "RSI 14"] if show_rsi else ["", ""]
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.78, 0.22], vertical_spacing=0.03,
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        row_heights=row_heights,
+        vertical_spacing=0.02,
+        subplot_titles=row_titles,
     )
+
+    x = df["date_cdmx"]
+
+    # ── 1. Candlesticks ───────────────────────────────────────────────────
     fig.add_trace(go.Candlestick(
-        x=df["date"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"], name="Precio",
-        increasing=dict(line=dict(color=_GREEN, width=1),
-                        fillcolor="rgba(34,197,94,0.65)"),
-        decreasing=dict(line=dict(color=_RED,   width=1),
-                        fillcolor="rgba(244,63,94,0.65)"),
+        x=x, open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"],
+        name="",
+        increasing=dict(
+            line=dict(color="#26a69a", width=1),
+            fillcolor="#26a69a",
+        ),
+        decreasing=dict(
+            line=dict(color="#ef5350", width=1),
+            fillcolor="#ef5350",
+        ),
         showlegend=False,
+        hovertext=[
+            f"O: {o:.2f}  H: {h:.2f}  L: {l:.2f}  C: {c:.2f}"
+            for o, h, l, c in zip(df["open"], df["high"], df["low"], df["close"])
+        ],
+        hoverinfo="x+text",
     ), row=1, col=1)
 
-    vol_colors = [
-        "rgba(34,197,94,0.5)" if c >= o else "rgba(244,63,94,0.4)"
-        for o, c in zip(df["open"], df["close"])
-    ]
-    fig.add_trace(go.Bar(
-        x=df["date"], y=df["volume"],
-        marker_color=vol_colors, marker_line_width=0,
-        name="Volumen", showlegend=False,
-    ), row=2, col=1)
+    # ── 2. EMAs ───────────────────────────────────────────────────────────
+    if show_ema:
+        for col, color, lbl in [
+            ("ema9",  "#f59e0b", "EMA 9"),
+            ("ema21", "#60a5fa", "EMA 21"),
+            ("ema50", "#a78bfa", "EMA 50"),
+        ]:
+            fig.add_trace(go.Scatter(
+                x=x, y=df[col], name=lbl,
+                line=dict(color=color, width=1.2),
+                hovertemplate=f"{lbl}: %{{y:.2f}}<extra></extra>",
+            ), row=1, col=1)
 
-    x0, x1 = df["date"].iloc[0], df["date"].iloc[-1]
+    # ── 3. VWAP ───────────────────────────────────────────────────────────
+    if show_vwap and is_intraday and "vwap" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=x, y=df["vwap"], name="VWAP",
+            line=dict(color="#f97316", width=1.5, dash="dot"),
+            hovertemplate="VWAP: %{y:.2f}<extra></extra>",
+        ), row=1, col=1)
 
-    def _hl(y, color, dash, width, label):
-        if y is None: return
-        fig.add_shape(type="line", x0=x0, x1=x1, y0=y, y1=y,
+    # ── 4. GEX levels ─────────────────────────────────────────────────────
+    x0_v, x1_v = x.iloc[0], x.iloc[-1]
+
+    def _lvl(y, color, dash, width, label):
+        if y is None or y <= 0: return
+        fig.add_shape(type="line", x0=x0_v, x1=x1_v, y0=y, y1=y,
                       line=dict(color=color, width=width, dash=dash),
-                      row=1, col=1)
-        fig.add_annotation(x=x1, y=y, text=f" {label} ${y:.1f}",
-                           showarrow=False, xanchor="left",
-                           font=dict(size=9, color=color, family=_FONT_MONO),
-                           row=1, col=1)
+                      row=1, col=1, xref="x", yref="y")
+        fig.add_annotation(
+            x=x1_v, y=y, text=f" {label}  {y:.2f}",
+            showarrow=False, xanchor="left",
+            font=dict(size=9, color=color, family=_FONT_MONO),
+            row=1, col=1,
+        )
 
-    _hl(spot,                   _ORANGE,   "solid",  2.0, "SPOT")
-    _hl(gex_key.get("call_wall"), _GREEN,  "dash",   1.2, "CALL WALL")
-    _hl(gex_key.get("put_wall"),  _RED,    "dash",   1.2, "PUT WALL")
-    _hl(gex_key.get("gamma_flip"), "#a855f7", "dot", 1.5, "HVL")
-    _hl(mp,                     "#64748b",  "dashdot", 1.0, "MAX PAIN")
+    _lvl(spot,                      "#f97316", "solid",   2.0, "●")
+    _lvl(gex_key.get("call_wall"),   "#22c55e", "dash",    1.3, "CALL WALL")
+    _lvl(gex_key.get("put_wall"),    "#ef4444", "dash",    1.3, "PUT WALL")
+    _lvl(gex_key.get("gamma_flip"),  "#a855f7", "dot",     1.5, "HVL")
+    _lvl(mp,                         "#64748b", "dashdot", 1.0, "MAX PAIN")
 
     if em_lo and em_hi:
         fig.add_hrect(y0=em_lo, y1=em_hi,
                       fillcolor="rgba(168,85,247,0.05)",
-                      line=dict(color="rgba(168,85,247,0.2)", width=0.5),
+                      line=dict(color="rgba(168,85,247,0.18)", width=0.8),
                       row=1, col=1)
 
+    # ── 5. Volume bars ────────────────────────────────────────────────────
+    vol_colors = [
+        "#26a69a" if c >= o else "#ef5350"
+        for o, c in zip(df["open"], df["close"])
+    ]
+    fig.add_trace(go.Bar(
+        x=x, y=df["volume"],
+        marker_color=vol_colors, marker_line_width=0,
+        name="Vol", showlegend=False, opacity=0.7,
+        hovertemplate="Vol: %{y:,.0f}<extra></extra>",
+    ), row=2, col=1)
+
+    # ── 6. RSI ────────────────────────────────────────────────────────────
+    if show_rsi:
+        rsi_row = 3
+        fig.add_trace(go.Scatter(
+            x=x, y=df["rsi"], name="RSI",
+            line=dict(color="#60a5fa", width=1.3),
+            hovertemplate="RSI: %{y:.1f}<extra></extra>",
+            showlegend=False,
+        ), row=rsi_row, col=1)
+        # RSI levels
+        for lvl, clr, alpha in [(70, "#ef4444", 0.08), (30, "#22c55e", 0.08), (50, "#ffffff", 0.0)]:
+            fig.add_hline(y=lvl, line_dash="dot",
+                          line_color=f"rgba({','.join(str(int(c,16)) for c in [clr[1:3],clr[3:5],clr[5:7]])},{0.3})",
+                          line_width=0.8, row=rsi_row, col=1)
+        # RSI overbought/oversold fill
+        fig.add_hrect(y0=70, y1=100, fillcolor="rgba(239,68,68,0.05)",
+                      line_width=0, row=rsi_row, col=1)
+        fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(34,197,94,0.05)",
+                      line_width=0, row=rsi_row, col=1)
+
+    # ── Layout ────────────────────────────────────────────────────────────
+    now_cdmx = datetime.datetime.now(_CDMX_TZ)
+    freq_lbl = f"{freq_min}m" if freq_min < 60 else f"{freq_min//60}h"
+    cw = gex_key.get("call_wall")
+    pw = gex_key.get("put_wall")
+    gf = gex_key.get("gamma_flip")
+
+    title_parts = [f"  {freq_lbl}  ·  CDMX {now_cdmx.strftime('%H:%M')}"]
+    if cw: title_parts.append(f"CALL WALL ${cw:.0f}")
+    if pw: title_parts.append(f"PUT WALL ${pw:.0f}")
+    if gf: title_parts.append(f"HVL ${gf:.0f}")
+
+    tv_bg   = "#131722"   # TradingView dark background
+    tv_grid = "rgba(255,255,255,0.06)"
+    tv_text = "#787b86"
+
     fig.update_layout(
-        height=520,
+        height=660,
+        plot_bgcolor=tv_bg, paper_bgcolor="#0e1117",
+        font=dict(size=10, family=_FONT_MONO, color=tv_text),
+        margin=dict(l=60, r=120, t=36, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                    xanchor="left", x=0,
+                    font=dict(size=10, color=tv_text),
+                    bgcolor="rgba(0,0,0,0)"),
         xaxis_rangeslider_visible=False,
-        xaxis2_rangeslider_visible=False,
-        **_BASE,
+        hoverlabel=dict(bgcolor="#1e222d", font_size=11,
+                        font_family=_FONT_MONO, bordercolor="#363a45"),
+        title=dict(text="  ·  ".join(title_parts),
+                   font=dict(size=10, color=tv_text, family=_FONT_MONO), x=0),
     )
-    fig.update_xaxes(**_AX_NOZERO, tickformat="%H:%M\n%b %d", row=1, col=1)
-    fig.update_xaxes(**_AX_NOZERO, tickformat="%H:%M\n%b %d", row=2, col=1)
-    fig.update_yaxes(**_AX_NOZERO, title_text="$", row=1, col=1)
-    fig.update_yaxes(**_AX_NOZERO, title_text="Vol", row=2, col=1)
+
+    ax_style = dict(
+        showgrid=True, gridcolor=tv_grid, gridwidth=1,
+        linecolor="#363a45", linewidth=1, showline=True,
+        tickfont=dict(size=9, family=_FONT_MONO, color=tv_text),
+        zeroline=False,
+    )
+    fig.update_xaxes(**ax_style)
+    fig.update_yaxes(**ax_style)
+
+    # Price axis right-side (TradingView style)
+    fig.update_yaxes(side="right", row=1, col=1)
+    fig.update_yaxes(side="right", row=2, col=1)
+    if show_rsi:
+        fig.update_yaxes(side="right", range=[0, 100], row=3, col=1,
+                         tickvals=[30, 50, 70])
+
+    # Timestamp format
+    ts_fmt = "%H:%M" if is_intraday else "%b %d"
+    for r in range(1, rows + 1):
+        fig.update_xaxes(tickformat=ts_fmt, row=r, col=1)
+
+    # Remove subplot title text artifacts
+    for ann in fig.layout.annotations:
+        if ann.text in ("", "RSI 14"):
+            ann.font.update(size=9, color=tv_text)
+
     return fig
 
 
@@ -2105,6 +2284,9 @@ def show_dashboard():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 
+    # today must be defined BEFORE any column/widget usage
+    today = datetime.date.today()
+
     # ── Top bar ─────────────────────────────────────────────────────────────
     b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.4, 1.8, 1.0, 1.0, 0.6])
 
@@ -2116,7 +2298,6 @@ def show_dashboard():
             placeholder="SPY, AAPL, QQQ…", label_visibility="collapsed").upper().strip()
 
     with b3:
-        today  = datetime.date.today()
         all_exps = st.session_state.get("all_exps", ["—"])
         sel_exp  = st.selectbox("exp", options=all_exps, label_visibility="collapsed",
                                 key="sel_exp")
@@ -2204,26 +2385,49 @@ def show_dashboard():
                 dte_v = int(float(str(_dte_vals.values[0]).split(".")[0]))
             except Exception:
                 dte_v = 0
-    iv_atm = calc_atm_iv(calls, spot)
-    p_c    = calc_pcr(calls, puts)
-    mp     = calc_max_pain(calls, puts)
+
+    # Use calls_all (ALL expirations) — more likely to have valid IV
+    iv_atm = calc_atm_iv(calls_all, spot)
+    if iv_atm is None:          # fallback to filtered expiry
+        iv_atm = calc_atm_iv(calls, spot)
+
+    p_c      = calc_pcr(calls, puts)
+    mp       = calc_max_pain(calls, puts)
     em_lo, em_hi = calc_expected_move(spot, iv_atm, dte_v)
-    _, gex_key  = calc_gex_advanced(calls_all, puts_all, spot)
-    total_gex   = gex_key.get("total_gex_bn")
-    # Use ALL expirations for skew and term structure — richer data
-    skew_df = calc_iv_skew(calls_all, puts_all, spot)
-    ts_df   = calc_term_structure(calls_all, spot)
-    dex_data = calc_dex_advanced(calls_all, puts_all, spot)
+    _, gex_key   = calc_gex_advanced(calls_all, puts_all, spot)
+    total_gex    = gex_key.get("total_gex_bn")
+    skew_df      = calc_iv_skew(calls_all, puts_all, spot)
+    ts_df        = calc_term_structure(calls_all, spot)
+    dex_data     = calc_dex_advanced(calls_all, puts_all, spot)
     last_refresh = st.session_state.get("last_refresh", datetime.datetime.now())
 
-    # ── Price history (cached per symbol per day) ─────────────────────────────
+    # ── Price history (cached per symbol+day) ─────────────────────────────────
     ph_key = f"ph_{symbol}_{today}"
     if ph_key not in st.session_state:
         ph_df, ph_err = fetch_price_history(symbol)
-        st.session_state[ph_key]      = ph_df
-        st.session_state[ph_key+"_err"] = ph_err
-    price_df = st.session_state.get(ph_key, pd.DataFrame())
+        st.session_state[ph_key]          = ph_df
+        st.session_state[ph_key + "_err"] = ph_err
+    price_df  = st.session_state.get(ph_key, pd.DataFrame())
     price_err = st.session_state.get(ph_key + "_err", "")
+
+    # ── Diagnostics expander ──────────────────────────────────────────────────
+    with st.expander("🔍 Diagnóstico", expanded=False):
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("calls_all",  len(calls_all))
+        d2.metric("puts_all",   len(puts_all))
+        d3.metric("ATM IV",     f"{iv_atm:.1f}%" if iv_atm else "None ⚠️")
+        d4.metric("price rows", len(price_df))
+        d5, d6, d7, d8 = st.columns(4)
+        iv_c = int((calls_all["IV%"] > 0.5).sum() if "IV%" in calls_all.columns else 0)
+        iv_p = int((puts_all["IV%"]  > 0.5).sum() if "IV%" in puts_all.columns  else 0)
+        d5.metric("IV válidos calls", iv_c)
+        d6.metric("IV válidos puts",  iv_p)
+        d7.metric("skew rows",  len(skew_df))
+        d8.metric("ts rows",    len(ts_df))
+        if price_err:
+            st.error(f"Price history: {price_err}")
+        if iv_c == 0:
+            st.warning("⚠️ Sin IV válido en calls — IV Skew, Term Structure y Vol Analysis estarán vacíos. Verifica que el símbolo tenga opciones líquidas.")
 
     # ── Metrics row ──────────────────────────────────────────────────────────
     chg_color  = "#22c55e" if chg >= 0 else "#f43f5e"
@@ -2331,7 +2535,9 @@ def show_dashboard():
                     unsafe_allow_html=True,
                 )
         with c_cand:
-            fig_cand = chart_candlestick_gex(intra_df, spot, gex_key, mp, em_lo, em_hi)
+            fig_cand = chart_candlestick_gex(
+                intra_df, spot, gex_key, mp, em_lo, em_hi,
+                freq_min=intra_freq)
             if fig_cand:
                 st.plotly_chart(fig_cand, use_container_width=True)
     else:
