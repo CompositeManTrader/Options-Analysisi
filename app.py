@@ -1922,12 +1922,19 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
     return fig
 
 
-def _to_cdmx(dates: pd.Series) -> pd.Series:
-    """Convert UTC timestamps to CDMX time (America/Mexico_City)."""
+def _to_cdmx_naive(dates: pd.Series) -> pd.Series:
+    """
+    Convert UTC timestamps → CDMX local time as TIMEZONE-NAIVE strings.
+    Critical: must strip tz info AFTER converting, otherwise Plotly
+    silently reconverts aware timestamps back to UTC for display.
+    """
     try:
         if dates.dt.tz is None:
-            return dates.dt.tz_localize("UTC").dt.tz_convert(_CDMX_TZ)
-        return dates.dt.tz_convert(_CDMX_TZ)
+            aware = dates.dt.tz_localize("UTC").dt.tz_convert(_CDMX_TZ)
+        else:
+            aware = dates.dt.tz_convert(_CDMX_TZ)
+        # Strip timezone — Plotly will use the face value as-is ✅
+        return aware.dt.tz_localize(None)
     except Exception:
         return dates
 
@@ -1940,221 +1947,336 @@ def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain  = delta.clip(lower=0).rolling(period).mean()
     loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / (loss + 1e-10)
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + gain / (loss + 1e-10)))
 
 
 def _vwap(df: pd.DataFrame) -> pd.Series:
-    """Intraday VWAP (resets each day)."""
     tp = (df["high"] + df["low"] + df["close"]) / 3
     return (tp * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-10)
 
 
-def chart_candlestick_gex(price_df: pd.DataFrame, spot: float, gex_key: dict,
-                          mp: float = None, em_lo: float = None, em_hi: float = None,
-                          show_ema: bool = True, show_vwap: bool = True,
-                          show_rsi: bool = True, freq_min: int = 1):
+def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
+                    mp: float = None, em_lo: float = None, em_hi: float = None,
+                    freq_min: int = 1):
     """
-    Professional TradingView-style candlestick chart.
-    - CDMX timezone (America/Mexico_City)
-    - EMA 9, 21, 50
-    - VWAP (intraday only)
-    - RSI 14 subplot
-    - Volume color-coded bars
-    - GEX structural levels: Call Wall, Put Wall, HVL, Max Pain, EM band
+    TradingView-style chart using lightweight-charts JS (open-source from TradingView).
+    Rendered via st.components.v1.html() — fully interactive:
+    - Scroll, zoom (mouse wheel + pinch), crosshair
+    - CDMX timezone (naive local timestamps)
+    - Candlestick + Volume + EMA 9/21/50 + VWAP + RSI
+    - GEX structural levels as horizontal price lines
     """
+    import json
+    import streamlit.components.v1 as components
+
     if price_df.empty:
-        return None
+        st.caption("Sin datos para la gráfica.")
+        return
 
     df = price_df.copy()
 
-    # ── Timezone conversion to CDMX ──────────────────────────────────────
-    df["date_cdmx"] = _to_cdmx(df["date"])
+    # ── Timezone → CDMX naive ─────────────────────────────────────────────
+    df["date_local"] = _to_cdmx_naive(df["date"])
 
     # ── Technical indicators ──────────────────────────────────────────────
-    df["ema9"]  = _ema(df["close"], 9)
-    df["ema21"] = _ema(df["close"], 21)
-    df["ema50"] = _ema(df["close"], 50)
-    df["rsi"]   = _rsi(df["close"], 14)
-    is_intraday = freq_min < 1440  # anything less than 1-day bars
-    if is_intraday:
-        df["vwap"] = _vwap(df)
+    df["ema9"]  = _ema(df["close"], 9).round(4)
+    df["ema21"] = _ema(df["close"], 21).round(4)
+    df["ema50"] = _ema(df["close"], 50).round(4)
+    df["rsi"]   = _rsi(df["close"], 14).round(2)
+    df["vwap"]  = _vwap(df).round(4)
+    df = df.dropna(subset=["open","high","low","close"])
 
-    # ── Subplots ──────────────────────────────────────────────────────────
-    rows       = 3 if show_rsi else 2
-    row_heights = [0.65, 0.18, 0.17] if show_rsi else [0.78, 0.22]
-    row_titles  = ["", "", "RSI 14"] if show_rsi else ["", ""]
+    # ── Serialize to lightweight-charts format ────────────────────────────
+    # lightweight-charts wants: {time: "YYYY-MM-DDTHH:MM:SS", open, high, low, close}
+    def to_lw_candles(df):
+        return [
+            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
+             "open": float(row["open"]), "high": float(row["high"]),
+             "low":  float(row["low"]),  "close": float(row["close"])}
+            for _, row in df.iterrows()
+        ]
 
-    fig = make_subplots(
-        rows=rows, cols=1,
-        shared_xaxes=True,
-        row_heights=row_heights,
-        vertical_spacing=0.02,
-        subplot_titles=row_titles,
-    )
+    def to_lw_line(df, col):
+        return [
+            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
+             "value": float(row[col])}
+            for _, row in df[df[col].notna()].iterrows()
+        ]
 
-    x = df["date_cdmx"]
+    def to_lw_volume(df):
+        return [
+            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
+             "value": float(row["volume"]),
+             "color": "#26a69a" if row["close"] >= row["open"] else "#ef5350"}
+            for _, row in df.iterrows()
+        ]
 
-    # ── 1. Candlesticks ───────────────────────────────────────────────────
-    fig.add_trace(go.Candlestick(
-        x=x, open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"],
-        name="",
-        increasing=dict(
-            line=dict(color="#26a69a", width=1),
-            fillcolor="#26a69a",
-        ),
-        decreasing=dict(
-            line=dict(color="#ef5350", width=1),
-            fillcolor="#ef5350",
-        ),
-        showlegend=False,
-        hovertext=[
-            f"O: {o:.2f}  H: {h:.2f}  L: {l:.2f}  C: {c:.2f}"
-            for o, h, l, c in zip(df["open"], df["high"], df["low"], df["close"])
-        ],
-        hoverinfo="x+text",
-    ), row=1, col=1)
+    def to_lw_rsi(df):
+        return [
+            {"time": row["date_local"].strftime("%Y-%m-%dT%H:%M:%S"),
+             "value": float(row["rsi"])}
+            for _, row in df[df["rsi"].notna()].iterrows()
+        ]
 
-    # ── 2. EMAs ───────────────────────────────────────────────────────────
-    if show_ema:
-        for col, color, lbl in [
-            ("ema9",  "#f59e0b", "EMA 9"),
-            ("ema21", "#60a5fa", "EMA 21"),
-            ("ema50", "#a78bfa", "EMA 50"),
-        ]:
-            fig.add_trace(go.Scatter(
-                x=x, y=df[col], name=lbl,
-                line=dict(color=color, width=1.2),
-                hovertemplate=f"{lbl}: %{{y:.2f}}<extra></extra>",
-            ), row=1, col=1)
+    candles = json.dumps(to_lw_candles(df))
+    volumes = json.dumps(to_lw_volume(df))
+    ema9    = json.dumps(to_lw_line(df, "ema9"))
+    ema21   = json.dumps(to_lw_line(df, "ema21"))
+    ema50   = json.dumps(to_lw_line(df, "ema50"))
+    vwap    = json.dumps(to_lw_line(df, "vwap"))
+    rsi_data= json.dumps(to_lw_rsi(df))
 
-    # ── 3. VWAP ───────────────────────────────────────────────────────────
-    if show_vwap and is_intraday and "vwap" in df.columns:
-        fig.add_trace(go.Scatter(
-            x=x, y=df["vwap"], name="VWAP",
-            line=dict(color="#f97316", width=1.5, dash="dot"),
-            hovertemplate="VWAP: %{y:.2f}<extra></extra>",
-        ), row=1, col=1)
-
-    # ── 4. GEX levels ─────────────────────────────────────────────────────
-    x0_v, x1_v = x.iloc[0], x.iloc[-1]
-
-    def _lvl(y, color, dash, width, label):
-        if y is None or y <= 0: return
-        fig.add_shape(type="line", x0=x0_v, x1=x1_v, y0=y, y1=y,
-                      line=dict(color=color, width=width, dash=dash),
-                      row=1, col=1, xref="x", yref="y")
-        fig.add_annotation(
-            x=x1_v, y=y, text=f" {label}  {y:.2f}",
-            showarrow=False, xanchor="left",
-            font=dict(size=9, color=color, family=_FONT_MONO),
-            row=1, col=1,
-        )
-
-    _lvl(spot,                      "#f97316", "solid",   2.0, "●")
-    _lvl(gex_key.get("call_wall"),   "#22c55e", "dash",    1.3, "CALL WALL")
-    _lvl(gex_key.get("put_wall"),    "#ef4444", "dash",    1.3, "PUT WALL")
-    _lvl(gex_key.get("gamma_flip"),  "#a855f7", "dot",     1.5, "HVL")
-    _lvl(mp,                         "#64748b", "dashdot", 1.0, "MAX PAIN")
-
-    if em_lo and em_hi:
-        fig.add_hrect(y0=em_lo, y1=em_hi,
-                      fillcolor="rgba(168,85,247,0.05)",
-                      line=dict(color="rgba(168,85,247,0.18)", width=0.8),
-                      row=1, col=1)
-
-    # ── 5. Volume bars ────────────────────────────────────────────────────
-    vol_colors = [
-        "#26a69a" if c >= o else "#ef5350"
-        for o, c in zip(df["open"], df["close"])
-    ]
-    fig.add_trace(go.Bar(
-        x=x, y=df["volume"],
-        marker_color=vol_colors, marker_line_width=0,
-        name="Vol", showlegend=False, opacity=0.7,
-        hovertemplate="Vol: %{y:,.0f}<extra></extra>",
-    ), row=2, col=1)
-
-    # ── 6. RSI ────────────────────────────────────────────────────────────
-    if show_rsi:
-        rsi_row = 3
-        fig.add_trace(go.Scatter(
-            x=x, y=df["rsi"], name="RSI",
-            line=dict(color="#60a5fa", width=1.3),
-            hovertemplate="RSI: %{y:.1f}<extra></extra>",
-            showlegend=False,
-        ), row=rsi_row, col=1)
-        # RSI levels
-        for lvl, clr, alpha in [(70, "#ef4444", 0.08), (30, "#22c55e", 0.08), (50, "#ffffff", 0.0)]:
-            fig.add_hline(y=lvl, line_dash="dot",
-                          line_color=f"rgba({','.join(str(int(c,16)) for c in [clr[1:3],clr[3:5],clr[5:7]])},{0.3})",
-                          line_width=0.8, row=rsi_row, col=1)
-        # RSI overbought/oversold fill
-        fig.add_hrect(y0=70, y1=100, fillcolor="rgba(239,68,68,0.05)",
-                      line_width=0, row=rsi_row, col=1)
-        fig.add_hrect(y0=0,  y1=30,  fillcolor="rgba(34,197,94,0.05)",
-                      line_width=0, row=rsi_row, col=1)
-
-    # ── Layout ────────────────────────────────────────────────────────────
-    now_cdmx = datetime.datetime.now(_CDMX_TZ)
-    freq_lbl = f"{freq_min}m" if freq_min < 60 else f"{freq_min//60}h"
+    # GEX level lines
     cw = gex_key.get("call_wall")
     pw = gex_key.get("put_wall")
     gf = gex_key.get("gamma_flip")
 
-    title_parts = [f"  {freq_lbl}  ·  CDMX {now_cdmx.strftime('%H:%M')}"]
-    if cw: title_parts.append(f"CALL WALL ${cw:.0f}")
-    if pw: title_parts.append(f"PUT WALL ${pw:.0f}")
-    if gf: title_parts.append(f"HVL ${gf:.0f}")
+    def price_line(price, color, title, style=0):
+        # style: 0=solid, 1=dotted, 2=dashed, 3=large dashed, 4=sparse dotted
+        if price is None or price <= 0:
+            return "null"
+        return json.dumps({"price": float(price), "color": color,
+                            "lineWidth": 1, "lineStyle": style,
+                            "axisLabelVisible": True, "title": title})
 
-    tv_bg   = "#131722"   # TradingView dark background
-    tv_grid = "rgba(255,255,255,0.06)"
-    tv_text = "#787b86"
+    gex_lines = {
+        "spot":      price_line(spot,  "#f97316", f"● {spot:.2f}", 0),
+        "call_wall": price_line(cw,    "#22c55e", f"CW {cw:.0f}" if cw else "", 2),
+        "put_wall":  price_line(pw,    "#ef4444", f"PW {pw:.0f}" if pw else "", 2),
+        "hvl":       price_line(gf,    "#a855f7", f"HVL {gf:.0f}" if gf else "", 1),
+        "max_pain":  price_line(mp,    "#94a3b8", f"MP {mp:.0f}" if mp else "", 4),
+        "em_hi":     price_line(em_hi, "#a855f780", f"EM+ {em_hi:.0f}" if em_hi else "", 4),
+        "em_lo":     price_line(em_lo, "#a855f780", f"EM- {em_lo:.0f}" if em_lo else "", 4),
+    }
 
-    fig.update_layout(
-        height=660,
-        plot_bgcolor=tv_bg, paper_bgcolor="#0e1117",
-        font=dict(size=10, family=_FONT_MONO, color=tv_text),
-        margin=dict(l=60, r=120, t=36, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                    xanchor="left", x=0,
-                    font=dict(size=10, color=tv_text),
-                    bgcolor="rgba(0,0,0,0)"),
-        xaxis_rangeslider_visible=False,
-        hoverlabel=dict(bgcolor="#1e222d", font_size=11,
-                        font_family=_FONT_MONO, bordercolor="#363a45"),
-        title=dict(text="  ·  ".join(title_parts),
-                   font=dict(size=10, color=tv_text, family=_FONT_MONO), x=0),
-    )
+    now_cdmx = datetime.datetime.now(_CDMX_TZ)
+    freq_label = f"{freq_min}m" if freq_min < 60 else f"{freq_min//60}h"
 
-    ax_style = dict(
-        showgrid=True, gridcolor=tv_grid, gridwidth=1,
-        linecolor="#363a45", linewidth=1, showline=True,
-        tickfont=dict(size=9, family=_FONT_MONO, color=tv_text),
-        zeroline=False,
-    )
-    fig.update_xaxes(**ax_style)
-    fig.update_yaxes(**ax_style)
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:#131722; color:#d1d4dc; font-family:'JetBrains Mono',monospace; }}
+  #header {{
+    display:flex; align-items:center; gap:16px; padding:8px 12px;
+    background:#1e222d; border-bottom:1px solid #2a2e39; font-size:11px;
+  }}
+  #sym {{ font-weight:700; font-size:13px; color:#d1d4dc; }}
+  .hchip {{ padding:2px 8px; border-radius:3px; font-size:10px; font-weight:600; }}
+  .chip-green {{ background:rgba(38,166,154,.18); color:#26a69a; }}
+  .chip-red   {{ background:rgba(239,83,80,.18);  color:#ef5350; }}
+  .chip-orange{{ background:rgba(249,115,22,.18); color:#f97316; }}
+  .chip-purple{{ background:rgba(168,85,247,.18); color:#a855f7; }}
+  .chip-gray  {{ background:rgba(148,163,184,.12);color:#94a3b8; }}
+  #tz-label {{ margin-left:auto; color:#787b86; font-size:10px; }}
+  #legend {{
+    display:flex; gap:10px; padding:4px 12px;
+    background:#1e222d; border-bottom:1px solid #2a2e39; font-size:10px;
+  }}
+  .leg {{ display:flex; align-items:center; gap:4px; color:#787b86; }}
+  .leg-dot {{ width:8px; height:2px; border-radius:1px; }}
+  #chart-container {{ position:relative; width:100%; }}
+  #chart {{ width:100%; height:440px; }}
+  #rsi-chart {{ width:100%; height:100px; }}
+  #rsi-label {{
+    position:absolute; right:8px; font-size:9px; color:#787b86;
+    pointer-events:none;
+  }}
+  .ohlc-tooltip {{
+    position:absolute; top:8px; left:12px; font-size:10px;
+    color:#d1d4dc; pointer-events:none; z-index:10;
+    background:rgba(19,23,34,.85); padding:4px 8px; border-radius:4px;
+    border:1px solid #2a2e39; display:none;
+  }}
+</style>
+</head>
+<body>
 
-    # Price axis right-side (TradingView style)
-    fig.update_yaxes(side="right", row=1, col=1)
-    fig.update_yaxes(side="right", row=2, col=1)
-    if show_rsi:
-        fig.update_yaxes(side="right", range=[0, 100], row=3, col=1,
-                         tickvals=[30, 50, 70])
+<div id="header">
+  <span id="sym">⬛ {spot:.2f}</span>
+  <span class="hchip chip-orange">{freq_label}</span>
+  {"" if not cw else f'<span class="hchip chip-green">CW ${cw:.0f}</span>'}
+  {"" if not pw else f'<span class="hchip chip-red">PW ${pw:.0f}</span>'}
+  {"" if not gf else f'<span class="hchip chip-purple">HVL ${gf:.0f}</span>'}
+  {"" if not mp else f'<span class="hchip chip-gray">MP ${mp:.0f}</span>'}
+  <span id="tz-label">CDMX {now_cdmx.strftime('%H:%M:%S')} (UTC-6)</span>
+</div>
 
-    # Timestamp format
-    ts_fmt = "%H:%M" if is_intraday else "%b %d"
-    for r in range(1, rows + 1):
-        fig.update_xaxes(tickformat=ts_fmt, row=r, col=1)
+<div id="legend">
+  <div class="leg"><div class="leg-dot" style="background:#f59e0b"></div>EMA 9</div>
+  <div class="leg"><div class="leg-dot" style="background:#60a5fa"></div>EMA 21</div>
+  <div class="leg"><div class="leg-dot" style="background:#a78bfa"></div>EMA 50</div>
+  <div class="leg"><div class="leg-dot" style="background:#f97316;height:1px;border-top:1px dashed #f97316;width:12px"></div>VWAP</div>
+  <div class="leg"><span style="color:#787b86;font-size:9px">Scroll=pan · Ctrl+Scroll=zoom · Dbl-click=reset</span></div>
+</div>
 
-    # Remove subplot title text artifacts
-    for ann in fig.layout.annotations:
-        if ann.text in ("", "RSI 14"):
-            ann.font.update(size=9, color=tv_text)
+<div id="chart-container">
+  <div class="ohlc-tooltip" id="tooltip"></div>
+  <div id="chart"></div>
+  <div id="rsi-chart"></div>
+</div>
 
-    return fig
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const CANDLES  = {candles};
+const VOLUMES  = {volumes};
+const EMA9     = {ema9};
+const EMA21    = {ema21};
+const EMA50    = {ema50};
+const VWAP     = {vwap};
+const RSI_DATA = {rsi_data};
+
+const GEX = {{
+  spot:      {gex_lines['spot']},
+  call_wall: {gex_lines['call_wall']},
+  put_wall:  {gex_lines['put_wall']},
+  hvl:       {gex_lines['hvl']},
+  max_pain:  {gex_lines['max_pain']},
+  em_hi:     {gex_lines['em_hi']},
+  em_lo:     {gex_lines['em_lo']},
+}};
+
+const TV_OPTS = {{
+  layout: {{
+    background: {{ type:'solid', color:'#131722' }},
+    textColor: '#787b86',
+    fontFamily: "'JetBrains Mono', monospace",
+    fontSize: 10,
+  }},
+  grid: {{
+    vertLines: {{ color:'rgba(42,46,57,0.6)', style:1 }},
+    horzLines: {{ color:'rgba(42,46,57,0.6)', style:1 }},
+  }},
+  crosshair: {{
+    mode: LightweightCharts.CrosshairMode.Normal,
+    vertLine: {{ color:'#758696', width:1, style:1, labelBackgroundColor:'#2a2e39' }},
+    horzLine: {{ color:'#758696', width:1, style:1, labelBackgroundColor:'#2a2e39' }},
+  }},
+  rightPriceScale: {{ borderColor:'#2a2e39' }},
+  timeScale: {{
+    borderColor: '#2a2e39',
+    timeVisible: true,
+    secondsVisible: false,
+    tickMarkFormatter: (time) => {{
+      const d = new Date(time * 1000);
+      return d.toLocaleTimeString('es-MX', {{hour:'2-digit', minute:'2-digit', hour12:false}});
+    }},
+  }},
+  handleScroll: {{ mouseWheel:true, pressedMouseMove:true, horzTouchDrag:true }},
+  handleScale: {{ mouseWheel:true, pinch:true, axisPressedMouseMove:true }},
+}};
+
+// ── Main price chart ──────────────────────────────────────────────────────
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {{
+  ...TV_OPTS,
+  width:  document.getElementById('chart').offsetWidth,
+  height: 440,
+}});
+
+const candleSeries = chart.addCandlestickSeries({{
+  upColor:   '#26a69a', downColor: '#ef5350',
+  borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+  wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+}});
+candleSeries.setData(CANDLES);
+
+// Volume as histogram overlay (scaled)
+const volSeries = chart.addHistogramSeries({{
+  priceFormat: {{ type:'volume' }},
+  priceScaleId: 'vol',
+  scaleMargins: {{ top:0.85, bottom:0 }},
+}});
+volSeries.setData(VOLUMES);
+chart.priceScale('vol').applyOptions({{ scaleMargins:{{top:0.85, bottom:0}} }});
+
+// EMAs
+const ema9s  = chart.addLineSeries({{ color:'#f59e0b', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
+const ema21s = chart.addLineSeries({{ color:'#60a5fa', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
+const ema50s = chart.addLineSeries({{ color:'#a78bfa', lineWidth:1, lastValueVisible:false, priceLineVisible:false }});
+ema9s.setData(EMA9); ema21s.setData(EMA21); ema50s.setData(EMA50);
+
+// VWAP
+const vwapS = chart.addLineSeries({{ color:'#f97316', lineWidth:1.5, lineStyle:1, lastValueVisible:true, priceLineVisible:false }});
+vwapS.setData(VWAP);
+
+// GEX price lines on candlestick series
+for (const [k, line] of Object.entries(GEX)) {{
+  if (line) candleSeries.createPriceLine(line);
+}}
+
+// ── RSI chart (linked x-axis) ──────────────────────────────────────────────
+const rsiChart = LightweightCharts.createChart(document.getElementById('rsi-chart'), {{
+  ...TV_OPTS,
+  width:  document.getElementById('rsi-chart').offsetWidth,
+  height: 100,
+  timeScale: {{ ...TV_OPTS.timeScale, visible:false }},
+}});
+
+const rsiSeries = rsiChart.addLineSeries({{
+  color:'#60a5fa', lineWidth:1.5, lastValueVisible:true, priceLineVisible:false,
+  autoscaleInfoProvider: () => ({{ priceRange: {{ minValue:0, maxValue:100 }} }}),
+}});
+rsiSeries.setData(RSI_DATA);
+
+// RSI bands
+[70, 50, 30].forEach((lvl, i) => {{
+  rsiSeries.createPriceLine({{
+    price: lvl,
+    color: i===0 ? 'rgba(239,83,80,0.4)' : i===2 ? 'rgba(38,166,154,0.4)' : 'rgba(255,255,255,0.15)',
+    lineWidth: 1, lineStyle: 1, axisLabelVisible: false,
+  }});
+}});
+
+// ── Sync crosshair between charts ─────────────────────────────────────────
+function syncCrosshair(src, dst, param) {{
+  if (!param || !param.time) {{ dst.clearCrossHair(); return; }}
+  const x = src.timeScale().timeToCoordinate(param.time);
+  dst.setCrossHairXY(x, 200, true);
+}}
+chart.subscribeCrosshairMove(p => syncCrosshair(chart, rsiChart, p));
+rsiChart.subscribeCrosshairMove(p => syncCrosshair(rsiChart, chart, p));
+
+// ── OHLC tooltip ──────────────────────────────────────────────────────────
+const tooltip = document.getElementById('tooltip');
+chart.subscribeCrosshairMove(param => {{
+  if (!param.time || !param.seriesData.has(candleSeries)) {{
+    tooltip.style.display = 'none'; return;
+  }}
+  const c = param.seriesData.get(candleSeries);
+  const rsi = RSI_DATA.findLast(r => r.time <= param.time);
+  const chg = c.close - c.open;
+  const chgP = (chg / c.open * 100).toFixed(2);
+  const clr = chg >= 0 ? '#26a69a' : '#ef5350';
+  tooltip.style.display = 'block';
+  tooltip.innerHTML = `
+    <span style="color:${{clr}};font-weight:700">
+    O:${{c.open.toFixed(2)}} H:${{c.high.toFixed(2)}} L:${{c.low.toFixed(2)}} C:${{c.close.toFixed(2)}}
+    ${{chg>=0?'+':''}}${{chg.toFixed(2)}} (${{chg>=0?'+':''}}${{chgP}}%)
+    </span>
+    ${{rsi ? ` &nbsp;|&nbsp; RSI:${{rsi.value.toFixed(1)}}` : ''}}
+  `;
+}});
+
+// ── Resize handler ────────────────────────────────────────────────────────
+function resize() {{
+  const w = document.getElementById('chart-container').offsetWidth;
+  chart.applyOptions({{ width: w }});
+  rsiChart.applyOptions({{ width: w }});
+}}
+window.addEventListener('resize', resize);
+resize();
+
+// Auto-scroll to latest candle
+chart.timeScale().scrollToRealTime();
+</script>
+</body>
+</html>
+"""
+    components.html(html, height=590, scrolling=False)
+
 
 
 def chart_iv_skew(skew_df, spot):
@@ -2484,8 +2606,12 @@ def show_dashboard():
     # ── INTRADAY CANDLESTICK + GEX LEVELS ─────────────────────────────────────
     st.markdown('<p class="bb-header">PRECIO INTRADAY  ·  CANDLESTICK  +  ZONAS GEX</p>',
                 unsafe_allow_html=True)
+    st.caption(
+        "Gráfica interactiva: rueda del mouse = paneo · Ctrl+rueda = zoom · "
+        "Doble click = reset vista · Hora en tiempo de CDMX (UTC-6)"
+    )
 
-    c_ctrl1, c_ctrl2, c_ctrl3 = st.columns([1, 1, 4])
+    c_ctrl1, c_ctrl2, _ = st.columns([1, 1, 4])
     with c_ctrl1:
         intra_freq = st.selectbox("Frecuencia", [1, 5], index=0,
                                   format_func=lambda x: f"{x} min",
@@ -2504,48 +2630,15 @@ def show_dashboard():
     intra_err = st.session_state.get(intra_key + "_err", "")
 
     if not intra_df.empty:
-        c_cand, c_cand_lvl = st.columns([4, 1])
-        with c_cand_lvl:
-            st.markdown("<br>", unsafe_allow_html=True)
-            cw = gex_key.get("call_wall")
-            pw = gex_key.get("put_wall")
-            gf = gex_key.get("gamma_flip")
-            def _lvl_badge(label, val, clr):
-                if val is None: return
-                st.markdown(
-                    f'<div style="font-size:0.7rem;font-family:JetBrains Mono,monospace;'
-                    f'margin:5px 0;padding:4px 8px;border-left:3px solid {clr};'
-                    f'background:rgba(0,0,0,0.2);border-radius:0 4px 4px 0;">'
-                    f'<span style="color:{clr};font-weight:700">{label}</span>'
-                    f'<span style="color:#9090b0"> ${val:.1f}</span></div>',
-                    unsafe_allow_html=True,
-                )
-            _lvl_badge("SPOT",      spot, _ORANGE)
-            _lvl_badge("CALL WALL", cw,   _GREEN)
-            _lvl_badge("PUT WALL",  pw,   _RED)
-            _lvl_badge("HVL/FLIP",  gf,   "#a855f7")
-            _lvl_badge("MAX PAIN",  mp,   "#64748b")
-            if em_lo and em_hi:
-                st.markdown(
-                    f'<div style="font-size:0.7rem;font-family:JetBrains Mono,monospace;'
-                    f'margin:5px 0;padding:4px 8px;border-left:3px solid #a855f7;'
-                    f'background:rgba(0,0,0,0.2);border-radius:0 4px 4px 0;">'
-                    f'<span style="color:#a855f7;font-weight:700">±1σ EM</span>'
-                    f'<span style="color:#9090b0"> ${em_lo:.0f}–${em_hi:.0f}</span></div>',
-                    unsafe_allow_html=True,
-                )
-        with c_cand:
-            fig_cand = chart_candlestick_gex(
-                intra_df, spot, gex_key, mp, em_lo, em_hi,
-                freq_min=intra_freq)
-            if fig_cand:
-                st.plotly_chart(fig_cand, use_container_width=True)
+        render_tv_chart(intra_df, spot, gex_key, mp, em_lo, em_hi,
+                        freq_min=intra_freq)
     else:
         st.caption(
-            f"Datos intraday no disponibles. "
+            "Datos intraday no disponibles. "
             + (f"Error: `{intra_err}`" if intra_err else
-               "Verifica que el mercado esté abierto o que el símbolo sea válido.")
+               "Verifica que el mercado esté abierto o que el símbolo sea válido en Schwab.")
         )
+
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
