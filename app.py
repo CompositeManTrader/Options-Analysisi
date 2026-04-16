@@ -707,7 +707,11 @@ _REMAP = {
     "strikePrice": "Strike", "_exp": "Expiry", "_dte": "DTE",
     "bid": "Bid", "ask": "Ask", "mark": "Mark", "last": "Last",
     "totalVolume": "Volume", "openInterest": "OI",
-    "impliedVolatility": "IV%", "delta": "Delta", "gamma": "Gamma",
+    # Schwab chains API uses "volatility" for implied vol (decimal, e.g. 0.25 = 25%)
+    # Some versions / endpoints also use "impliedVolatility" — include both
+    "volatility":         "IV%",
+    "impliedVolatility":  "IV%_alt",   # mapped to alt name to avoid duplicate column
+    "delta": "Delta", "gamma": "Gamma",
     "theta": "Theta", "vega": "Vega", "rho": "Rho",
     "inTheMoney": "ITM", "theoreticalOptionValue": "Theo",
 }
@@ -716,8 +720,21 @@ _REMAP = {
 def clean(df):
     if df.empty:
         return df
+
+    # ── Resolve IV field: Schwab uses "volatility", fallback "impliedVolatility" ──
+    # We normalise whichever is present into a single "IV%" column before remapping.
+    df = df.copy()
+    if "volatility" not in df.columns and "impliedVolatility" in df.columns:
+        df["volatility"] = df["impliedVolatility"]
+    elif "volatility" not in df.columns:
+        df["volatility"] = float("nan")
+
     cols = {k: v for k, v in _REMAP.items() if k in df.columns}
     df = df[list(cols)].rename(columns=cols).copy()
+
+    # Drop the alt IV column if it crept in
+    df.drop(columns=["IV%_alt"], errors="ignore", inplace=True)
+
     for c, d in [("Bid",2), ("Ask",2), ("Mark",2), ("Last",2), ("Theo",2),
                  ("Delta",3), ("Theta",3), ("Gamma",4), ("Vega",4), ("Rho",4),
                  ("Strike",2)]:
@@ -729,10 +746,8 @@ def clean(df):
         df["OI"] = pd.to_numeric(df["OI"], errors="coerce").fillna(0).astype(int)
     if "Volume" in df.columns:
         df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0).astype(int)
-    # DTE must be numeric for sort/groupby to work correctly
     if "DTE" in df.columns:
         df["DTE"] = pd.to_numeric(df["DTE"], errors="coerce").fillna(0).astype(int)
-    # ITM must be boolean
     if "ITM" in df.columns:
         df["ITM"] = df["ITM"].astype(bool)
     return df
@@ -766,7 +781,7 @@ def calc_atm_iv(c, spot):
     """ATM IV — uses nearest-strike call with valid IV. Tries all expirations."""
     if c.empty or "IV%" not in c.columns or spot == 0:
         return None
-    valid = c[c["IV%"].notna() & (c["IV%"] > 0.5)].copy()  # >0.5% = valid
+    valid = c[c["IV%"].notna() & (c["IV%"] > 0.01)].copy()  # >0.01% = valid (non-zero)
     if valid.empty:
         return None
     # Sort by DTE to prefer nearest expiry
@@ -774,7 +789,7 @@ def calc_atm_iv(c, spot):
         valid = valid.sort_values("DTE")
     idx = (valid["Strike"] - spot).abs().idxmin()
     val = float(valid.loc[idx, "IV%"])
-    return val if val > 0.5 else None
+    return val if val > 0.01 else None
 
 
 def calc_expected_move(spot, iv_pct, dte):
@@ -947,9 +962,9 @@ def calc_iv_skew(c, p, spot):
         if "DTE" in df.columns:
             df["DTE"] = pd.to_numeric(df["DTE"], errors="coerce").fillna(9999)
 
-    # Keep only valid IV rows (> 0.5% means it's real, not placeholder)
-    c2 = c2[c2["IV%"].notna() & (c2["IV%"] > 0.5)].dropna(subset=["Strike"])
-    p2 = p2[p2["IV%"].notna() & (p2["IV%"] > 0.5)].dropna(subset=["Strike"])
+    # Keep only valid IV rows (> 0 and non-NaN)
+    c2 = c2[c2["IV%"].notna() & (c2["IV%"] > 0.01)].dropna(subset=["Strike"])
+    p2 = p2[p2["IV%"].notna() & (p2["IV%"] > 0.01)].dropna(subset=["Strike"])
 
     if c2.empty or p2.empty:
         return pd.DataFrame()
@@ -2364,8 +2379,8 @@ def show_dashboard():
         d3.metric("ATM IV",     f"{iv_atm:.1f}%" if iv_atm else "None ⚠️")
         d4.metric("price rows", len(price_df))
         d5, d6, d7, d8 = st.columns(4)
-        iv_c = int((calls_all["IV%"] > 0.5).sum() if "IV%" in calls_all.columns else 0)
-        iv_p = int((puts_all["IV%"]  > 0.5).sum() if "IV%" in puts_all.columns  else 0)
+        iv_c = int((calls_all["IV%"] > 0.01).sum() if "IV%" in calls_all.columns else 0)
+        iv_p = int((puts_all["IV%"]  > 0.01).sum() if "IV%" in puts_all.columns  else 0)
         d5.metric("IV válidos calls", iv_c)
         d6.metric("IV válidos puts",  iv_p)
         d7.metric("skew rows",  len(skew_df))
@@ -2373,7 +2388,14 @@ def show_dashboard():
         if price_err:
             st.error(f"Price history: {price_err}")
         if iv_c == 0:
-            st.warning("⚠️ Sin IV válido en calls — IV Skew, Term Structure y Vol Analysis estarán vacíos. Verifica que el símbolo tenga opciones líquidas.")
+            raw_cols = list(calls_raw.columns[:20]) if not calls_raw.empty else []
+            has_vol  = "volatility" in raw_cols
+            has_impl = "impliedVolatility" in raw_cols
+            st.warning(
+                f"⚠️ Sin IV válido en calls. "
+                f"Campo 'volatility' en API: {has_vol} | 'impliedVolatility': {has_impl}. "
+                f"Columnas raw (primeras 20): {raw_cols}"
+            )
 
     # ── Metrics row ──────────────────────────────────────────────────────────
     chg_color  = "#22c55e" if chg >= 0 else "#f43f5e"
