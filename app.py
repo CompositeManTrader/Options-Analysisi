@@ -640,40 +640,48 @@ def fetch_price_history(symbol: str, period: int = 1,
 def fetch_intraday(symbol: str, freq_min: int = 1, days: int = 1) -> tuple:
     """
     Intraday OHLCV at freq_min minute bars.
-    Always returns only candles from today (CDMX date) onward for days=1,
-    or the last N trading days for days>1.
-    Returns (DataFrame, error_str).
+    Does NOT pass startDate/endDate — lets Schwab return the last N trading days.
+    Filters client-side to the requested number of CDMX calendar days.
+    Returns (DataFrame with UTC-aware timestamps, error_str).
     """
     try:
-        # Determine startDate: midnight CDMX of N days ago → UTC ms
-        now_cdmx   = datetime.datetime.now(_CDMX_TZ)
-        day_offset = days - 1
-        start_cdmx = (now_cdmx - datetime.timedelta(days=day_offset)).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        start_utc_ms = int(start_cdmx.astimezone(pytz.utc).timestamp() * 1000)
-
         r = api_get("/marketdata/v1/pricehistory", params={
-            "symbol":               symbol,
-            "periodType":           "day",
-            "period":               min(days, 10),
-            "frequencyType":        "minute",
-            "frequency":            freq_min,
-            "startDate":            start_utc_ms,
-            "needExtendedHoursData":"false",
+            "symbol":                symbol,
+            "periodType":            "day",
+            "period":                min(max(days, 1), 10),
+            "frequencyType":         "minute",
+            "frequency":             freq_min,
+            "needExtendedHoursData": "false",
         })
         if r.status_code != 200:
-            return pd.DataFrame(), f"HTTP {r.status_code}: {r.text[:200]}"
+            return pd.DataFrame(), f"HTTP {r.status_code}: {r.text[:300]}"
         data = r.json()
         if data.get("empty", False):
             return pd.DataFrame(), f"Sin datos intraday para '{symbol}'."
         candles = data.get("candles", [])
         if not candles:
-            return pd.DataFrame(), "Sin velas intraday."
+            return pd.DataFrame(), "Sin velas intraday en la respuesta."
+
         df = pd.DataFrame(candles)
-        # Keep UTC timestamps as-is; timezone conversion happens in the chart
+        # Parse as UTC-aware timestamps
         df["date"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
         df = df[["date","open","high","low","close","volume"]].copy()
         df = df.sort_values("date").reset_index(drop=True)
+
+        # Filter to last N CDMX calendar days
+        if days == 1:
+            # Only the most recent trading session
+            df["date_cdmx"] = df["date"].dt.tz_convert(_CDMX_TZ)
+            last_date = df["date_cdmx"].dt.date.max()
+            df = df[df["date_cdmx"].dt.date == last_date].copy()
+            df = df.drop(columns=["date_cdmx"])
+        else:
+            df["date_cdmx"] = df["date"].dt.tz_convert(_CDMX_TZ)
+            cutoff = (df["date_cdmx"].max() - pd.Timedelta(days=days - 1)).normalize()
+            df = df[df["date_cdmx"] >= cutoff].copy()
+            df = df.drop(columns=["date_cdmx"])
+
+        df = df.reset_index(drop=True)
         return df, ""
     except Exception as e:
         return pd.DataFrame(), str(e)
