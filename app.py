@@ -1920,6 +1920,9 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
     )
     fig_rd = chart_returns_dist(analytics, symbol)
     if fig_rd: st.plotly_chart(fig_rd, width="stretch")
+
+
+def chart_iv_skew(skew_df, spot):
     if skew_df.empty:
         return None
     fig = make_subplots(rows=1, cols=2,
