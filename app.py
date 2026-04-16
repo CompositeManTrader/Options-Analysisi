@@ -2100,7 +2100,7 @@ new ResizeObserver(()=>{{const w=document.getElementById("w").offsetWidth;if(w>1
 mc.timeScale().scrollToRealTime();
 </script></body></html>"""
 
-    st.iframe(html, height=548, scrolling=False)
+    st.iframe(html, height=548)
 
 
 def chart_iv_skew(skew_df, spot):
