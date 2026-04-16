@@ -1521,14 +1521,14 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
                     unsafe_allow_html=True)
         st.caption("Calls → derecha (verde) · Puts → izquierda (rojo) · Gamma Flip")
         fig_lad = chart_gex_ladder(gex_df, spot, key, iv_adj)
-        if fig_lad: st.plotly_chart(fig_lad, use_container_width=True)
+        if fig_lad: st.plotly_chart(fig_lad, width="stretch")
 
     with col_r:
         st.markdown('<p class="bb-header" style="margin-top:0.3rem">GEX POR VENCIMIENTO</p>',
                     unsafe_allow_html=True)
         fig_exp = chart_gex_by_expiry(expiry_df)
         if fig_exp:
-            st.plotly_chart(fig_exp, use_container_width=True)
+            st.plotly_chart(fig_exp, width="stretch")
         else:
             st.caption("Requiere >1 vencimiento.")
 
@@ -1537,7 +1537,7 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
     st.caption("Suma acumulada de GEX desde el strike más bajo al más alto. "
                "El cruce por cero = Gamma Flip — donde el régimen cambia.")
     fig_cum = chart_gex_cumulative(gex_df, spot, key)
-    if fig_cum: st.plotly_chart(fig_cum, use_container_width=True)
+    if fig_cum: st.plotly_chart(fig_cum, width="stretch")
 
     # ── 2nd-order Greeks ───────────────────────────────────────────────────
     st.markdown('<p class="bb-header">GREEKS DE 2° ORDEN  —  Vanna & Charm</p>',
@@ -1549,7 +1549,7 @@ def render_gex_module(calls_all, puts_all, calls_exp, puts_exp, spot):
         "de delta-hedging intradía. Calculados con Black-Scholes."
     )
     fig_vc = chart_vanna_charm(calls_v, puts_v, spot)
-    if fig_vc: st.plotly_chart(fig_vc, use_container_width=True)
+    if fig_vc: st.plotly_chart(fig_vc, width="stretch")
     else: st.caption("Requiere columnas IV% y DTE en la cadena.")
 
 
@@ -1887,14 +1887,14 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
         st.caption("Bandas históricas de HV. La línea verde = ATM IV actual. "
                    "IV sobre la banda P75 → cara. Bajo P25 → barata.")
         fig_cone = chart_vol_cone(analytics, atm_iv, symbol)
-        if fig_cone: st.plotly_chart(fig_cone, use_container_width=True)
+        if fig_cone: st.plotly_chart(fig_cone, width="stretch")
 
     with c_hist:
         st.markdown('<p class="bb-header" style="margin-top:0">HV30 HISTÓRICA vs ATM IV</p>',
                     unsafe_allow_html=True)
         st.caption("Serie temporal de la volatilidad realizada a 30 días.")
         fig_hv = chart_iv_hv_history(analytics, atm_iv)
-        if fig_hv: st.plotly_chart(fig_hv, use_container_width=True)
+        if fig_hv: st.plotly_chart(fig_hv, width="stretch")
 
     # Returns distribution
     st.markdown('<p class="bb-header">DISTRIBUCIÓN DE RETORNOS DIARIOS</p>',
@@ -1904,7 +1904,7 @@ def render_vol_module(symbol: str, atm_iv: float, spot: float, price_df: pd.Data
         "Curtosis > 0 = colas gruesas (fat tails) = riesgo extremo mayor de lo que la vol implica."
     )
     fig_rd = chart_returns_dist(analytics, symbol)
-    if fig_rd: st.plotly_chart(fig_rd, use_container_width=True)
+    if fig_rd: st.plotly_chart(fig_rd, width="stretch")
     if skew_df.empty:
         return None
     fig = make_subplots(rows=1, cols=2,
@@ -1950,8 +1950,7 @@ def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
     Works correctly on Streamlit Cloud (server timezone = UTC).
     """
     import json
-    import streamlit.components.v1 as components
-
+    
     if price_df.empty:
         st.caption("Sin datos de precio para mostrar la gráfica.")
         return
@@ -2101,7 +2100,7 @@ new ResizeObserver(()=>{{const w=document.getElementById("w").offsetWidth;if(w>1
 mc.timeScale().scrollToRealTime();
 </script></body></html>"""
 
-    components.html(html, height=548, scrolling=False)
+    st.iframe(html, height=548, scrolling=False)
 
 
 def chart_iv_skew(skew_df, spot):
@@ -2474,7 +2473,7 @@ def show_dashboard():
     if not skew_df.empty:
         fig_skew = chart_iv_skew(skew_df, spot)
         if fig_skew:
-            st.plotly_chart(fig_skew, use_container_width=True)
+            st.plotly_chart(fig_skew, width="stretch")
         else:
             st.caption("IV Skew: no se pudo generar la gráfica.")
     else:
@@ -2493,7 +2492,7 @@ def show_dashboard():
         with c_ts:
             fig_ts = chart_term_structure(ts_df)
             if fig_ts:
-                st.plotly_chart(fig_ts, use_container_width=True)
+                st.plotly_chart(fig_ts, width="stretch")
         with c_ts_tbl:
             st.markdown("<br>", unsafe_allow_html=True)
             tbl = '<table style="font-family:JetBrains Mono,monospace;font-size:0.72rem;width:100%;">'
@@ -2519,7 +2518,7 @@ def show_dashboard():
 
     # ── OI / Volume ───────────────────────────────────────────────────────────
     st.markdown('<p class="bb-header">OPEN INTEREST  &  VOLUME</p>', unsafe_allow_html=True)
-    st.plotly_chart(chart_oi_volume(calls, puts, spot, em_lo, em_hi), use_container_width=True)
+    st.plotly_chart(chart_oi_volume(calls, puts, spot, em_lo, em_hi), width="stretch")
 
     st.markdown('<hr class="bb-divider">', unsafe_allow_html=True)
 
@@ -2532,7 +2531,7 @@ def show_dashboard():
     )
     fig_dex = chart_dex(dex_data, spot)
     if fig_dex:
-        st.plotly_chart(fig_dex, use_container_width=True)
+        st.plotly_chart(fig_dex, width="stretch")
     else:
         st.caption("DEX: requiere columnas OI y Delta en la cadena.")
 
