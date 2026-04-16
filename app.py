@@ -640,18 +640,26 @@ def fetch_price_history(symbol: str, period: int = 1,
 def fetch_intraday(symbol: str, freq_min: int = 1, days: int = 1) -> tuple:
     """
     Intraday OHLCV at freq_min minute bars.
-    freq_min: 1 or 5
-    days: 1–10
+    Always returns only candles from today (CDMX date) onward for days=1,
+    or the last N trading days for days>1.
     Returns (DataFrame, error_str).
     """
     try:
+        # Determine startDate: midnight CDMX of N days ago → UTC ms
+        now_cdmx   = datetime.datetime.now(_CDMX_TZ)
+        day_offset = days - 1
+        start_cdmx = (now_cdmx - datetime.timedelta(days=day_offset)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start_utc_ms = int(start_cdmx.astimezone(pytz.utc).timestamp() * 1000)
+
         r = api_get("/marketdata/v1/pricehistory", params={
-            "symbol":        symbol,
-            "periodType":    "day",
-            "period":        min(days, 10),
-            "frequencyType": "minute",
-            "frequency":     freq_min,
-            "needExtendedHoursData": "false",
+            "symbol":               symbol,
+            "periodType":           "day",
+            "period":               min(days, 10),
+            "frequencyType":        "minute",
+            "frequency":            freq_min,
+            "startDate":            start_utc_ms,
+            "needExtendedHoursData":"false",
         })
         if r.status_code != 200:
             return pd.DataFrame(), f"HTTP {r.status_code}: {r.text[:200]}"
@@ -662,9 +670,11 @@ def fetch_intraday(symbol: str, freq_min: int = 1, days: int = 1) -> tuple:
         if not candles:
             return pd.DataFrame(), "Sin velas intraday."
         df = pd.DataFrame(candles)
-        df["date"] = pd.to_datetime(df["datetime"], unit="ms")
+        # Keep UTC timestamps as-is; timezone conversion happens in the chart
+        df["date"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
         df = df[["date","open","high","low","close","volume"]].copy()
-        return df.sort_values("date").reset_index(drop=True), ""
+        df = df.sort_values("date").reset_index(drop=True)
+        return df, ""
     except Exception as e:
         return pd.DataFrame(), str(e)
 
@@ -1940,9 +1950,9 @@ def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
                     mp: float = None, em_lo: float = None, em_hi: float = None,
                     freq_min: int = 1):
     """
-    Candlestick + Volume + GEX structural zones via lightweight-charts.
-    NO technical indicators — only price action + GEX levels.
-    Time displayed in CDMX (UTC-6).
+    Candlestick + Volume + GEX levels via lightweight-charts v4.
+    Passes RAW UTC unix seconds. Uses JS Intl.DateTimeFormat('America/Mexico_City')
+    for CDMX display — works on Streamlit Cloud (server-side iframe = UTC).
     """
     import json
     import streamlit.components.v1 as components
@@ -1951,196 +1961,177 @@ def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
         st.caption("Sin datos para la gráfica.")
         return
 
-    df = price_df.copy()
-    df["date_local"] = _to_cdmx_naive(df["date"])
-    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = price_df.copy().dropna(subset=["open","high","low","close"])
+    if df.empty:
+        st.caption("Sin velas válidas.")
+        return
 
-    # lightweight-charts intraday: use Unix seconds (face-value local time)
-    # Convert naive local datetime → Unix seconds treating it AS IF it were UTC
-    # (this is intentional: we want the chart to display the CDMX time on the axis)
-    def to_unix_local(dt_naive):
-        import calendar
-        return int(calendar.timegm(dt_naive.timetuple()))
+    def to_utc_unix(dt):
+        ts = pd.Timestamp(dt)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.timestamp())
 
-    candles = [
-        {
-            "time": to_unix_local(row["date_local"].to_pydatetime()),
-            "open":  round(float(row["open"]),  4),
-            "high":  round(float(row["high"]),  4),
-            "low":   round(float(row["low"]),   4),
-            "close": round(float(row["close"]), 4),
-        }
-        for _, row in df.iterrows()
-    ]
+    candles = [{"time": to_utc_unix(r["date"]),
+                "open": round(float(r["open"]),4),
+                "high": round(float(r["high"]),4),
+                "low":  round(float(r["low"]),4),
+                "close":round(float(r["close"]),4)}
+               for _,r in df.iterrows()]
 
-    volumes = [
-        {
-            "time":  to_unix_local(row["date_local"].to_pydatetime()),
-            "value": float(row["volume"]),
-            "color": "#26a69a88" if row["close"] >= row["open"] else "#ef535088",
-        }
-        for _, row in df.iterrows()
-    ]
+    volumes = [{"time": to_utc_unix(r["date"]),
+                "value": float(r["volume"]),
+                "color": "#26a69a88" if r["close"]>=r["open"] else "#ef535088"}
+               for _,r in df.iterrows()]
 
-    # GEX levels
     cw = gex_key.get("call_wall")
     pw = gex_key.get("put_wall")
-    gf = gex_key.get("gamma_flip")   # renamed to "Gamma Flip"
+    gf = gex_key.get("gamma_flip")
 
     def pline(price, color, title, style=0, width=1):
-        if price is None or price <= 0:
-            return None
-        return {"price": float(price), "color": color,
-                "lineWidth": width, "lineStyle": style,
-                "axisLabelVisible": True, "title": title}
+        if not price or price <= 0: return None
+        return {"price":float(price),"color":color,"lineWidth":width,
+                "lineStyle":style,"axisLabelVisible":True,"title":title}
 
     gex_lines = [l for l in [
-        pline(spot,  "#f97316", f"SPOT  {spot:.2f}",              0, 2),
-        pline(cw,    "#22c55e", f"CALL WALL  {cw:.1f}" if cw else "", 2, 1),
-        pline(pw,    "#ef4444", f"PUT WALL  {pw:.1f}"  if pw else "", 2, 1),
-        pline(gf,    "#a855f7", f"GAMMA FLIP  {gf:.1f}" if gf else "", 1, 1),
-        pline(mp,    "#94a3b8", f"MAX PAIN  {mp:.1f}"  if mp else "", 4, 1),
-        pline(em_hi, "#a855f750", f"EM+  {em_hi:.1f}"  if em_hi else "", 3, 1),
-        pline(em_lo, "#a855f750", f"EM-  {em_lo:.1f}"  if em_lo else "", 3, 1),
+        pline(spot,  "#f97316", f"● {spot:.2f}",                   0, 2),
+        pline(cw,    "#22c55e", f"CALL WALL {cw:.1f}"  if cw else "", 2, 1),
+        pline(pw,    "#ef4444", f"PUT WALL {pw:.1f}"   if pw else "", 2, 1),
+        pline(gf,    "#a855f7", f"GAMMA FLIP {gf:.1f}" if gf else "", 1, 1),
+        pline(mp,    "#94a3b8", f"MAX PAIN {mp:.1f}"   if mp else "", 4, 1),
+        pline(em_hi, "#c084fc", f"EM+ {em_hi:.1f}"    if em_hi else "", 3, 1),
+        pline(em_lo, "#c084fc", f"EM- {em_lo:.1f}"    if em_lo else "", 3, 1),
     ] if l is not None]
 
-    freq_label = f"{freq_min}m" if freq_min < 60 else f"{freq_min//60}h"
+    freq_label = f"{freq_min}m"
     now_cdmx   = datetime.datetime.now(_CDMX_TZ)
-    last_close = float(df["close"].iloc[-1]) if not df.empty else spot
-    chg        = last_close - float(df["open"].iloc[0]) if not df.empty else 0
-    chg_pct    = chg / float(df["open"].iloc[0]) * 100 if df["open"].iloc[0] != 0 else 0
+    last_c     = float(df["close"].iloc[-1])
+    open_p     = float(df["open"].iloc[0])
+    chg        = last_c - open_p
+    chg_pct    = chg / open_p * 100 if open_p else 0
     chg_clr    = "#26a69a" if chg >= 0 else "#ef5350"
 
-    chips = ""
-    if cw:  chips += f'<span class="chip chip-g">CALL WALL {cw:.0f}</span>'
-    if pw:  chips += f'<span class="chip chip-r">PUT WALL {pw:.0f}</span>'
-    if gf:  chips += f'<span class="chip chip-p">GAMMA FLIP {gf:.0f}</span>'
-    if mp:  chips += f'<span class="chip chip-s">MAX PAIN {mp:.0f}</span>'
+    chips = "".join([
+        f'<span class="chip cg">CW {cw:.0f}</span>' if cw else "",
+        f'<span class="chip cr">PW {pw:.0f}</span>' if pw else "",
+        f'<span class="chip cp">GF {gf:.0f}</span>' if gf else "",
+        f'<span class="chip cs">MP {mp:.0f}</span>' if mp else "",
+    ])
 
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  *{{margin:0;padding:0;box-sizing:border-box}}
-  body{{background:#131722;color:#d1d4dc;font-family:'Courier New',monospace;overflow:hidden}}
-  #hdr{{
-    display:flex;align-items:center;gap:10px;padding:7px 14px;
-    background:#1e222d;border-bottom:1px solid #2a2e39;flex-wrap:wrap;
-  }}
-  #price{{font-weight:700;font-size:15px;color:#d1d4dc;letter-spacing:.03em}}
-  #chg{{font-size:11px;color:{chg_clr};font-weight:600}}
-  .chip{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;letter-spacing:.04em}}
-  .chip-g{{background:rgba(38,166,154,.15);color:#26a69a}}
-  .chip-r{{background:rgba(239,83,80,.15);color:#ef5350}}
-  .chip-p{{background:rgba(168,85,247,.15);color:#a855f7}}
-  .chip-s{{background:rgba(148,163,184,.12);color:#94a3b8}}
-  .chip-o{{background:rgba(249,115,22,.15);color:#f97316}}
-  #tz{{margin-left:auto;font-size:10px;color:#535964}}
-  #chart{{width:100%;height:460px}}
-  #vol{{width:100%;height:80px}}
-  #ohlc{{
-    position:absolute;top:54px;left:14px;font-size:10px;
-    color:#9598a1;pointer-events:none;z-index:5;
-    background:rgba(19,23,34,.7);padding:3px 8px;border-radius:3px;
-    display:none;
-  }}
-  #wrap{{position:relative}}
-</style>
-</head>
-<body>
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#131722;color:#d1d4dc;font-family:'Courier New',monospace;overflow:hidden}}
+#hdr{{display:flex;align-items:center;gap:8px;padding:6px 12px;
+  background:#1e222d;border-bottom:1px solid #2a2e39;flex-wrap:wrap}}
+#price{{font-weight:700;font-size:14px}}
+#pchg{{font-size:11px;font-weight:600;color:{chg_clr}}}
+.chip{{font-size:10px;font-weight:700;padding:2px 7px;border-radius:3px}}
+.cg{{background:rgba(38,166,154,.15);color:#26a69a}}
+.cr{{background:rgba(239,83,80,.15);color:#ef5350}}
+.cp{{background:rgba(168,85,247,.15);color:#a855f7}}
+.cs{{background:rgba(148,163,184,.12);color:#94a3b8}}
+.co{{background:rgba(249,115,22,.15);color:#f97316}}
+#tz{{margin-left:auto;font-size:10px;color:#535964;text-align:right;line-height:1.4}}
+#wrap{{position:relative;width:100%}}
+#tip{{position:absolute;top:44px;left:10px;font-size:10px;color:#9598a1;
+  pointer-events:none;z-index:10;background:rgba(19,23,34,.9);
+  padding:3px 8px;border-radius:3px;border:1px solid #2a2e39;display:none}}
+#mc{{width:100%;height:460px}}
+#vc{{width:100%;height:80px}}
+</style></head><body>
 <div id="hdr">
-  <span id="price">{last_close:.2f}</span>
-  <span id="chg">{chg:+.2f} ({chg_pct:+.2f}%)</span>
-  <span class="chip chip-o">{freq_label}</span>
+  <span id="price">{last_c:.2f}</span>
+  <span id="pchg">{chg:+.2f} ({chg_pct:+.2f}%)</span>
+  <span class="chip co">{freq_label}</span>
   {chips}
-  <span id="tz">CDMX {now_cdmx.strftime('%H:%M:%S')}</span>
+  <span id="tz">CDMX (UTC-6)<br>{now_cdmx.strftime('%H:%M:%S')}</span>
 </div>
 <div id="wrap">
-  <div id="ohlc"></div>
-  <div id="chart"></div>
-  <div id="vol"></div>
+  <div id="tip"></div>
+  <div id="mc"></div>
+  <div id="vc"></div>
 </div>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
-const CANDLES = {json.dumps(candles)};
-const VOLUMES = {json.dumps(volumes)};
-const GEX_LINES = {json.dumps(gex_lines)};
+const C={json.dumps(candles)}, V={json.dumps(volumes)}, G={json.dumps(gex_lines)};
+
+// CDMX formatter — takes UTC unix seconds, displays as CDMX time
+const FMT = new Intl.DateTimeFormat('es-MX', {{
+  timeZone:'America/Mexico_City',
+  hour:'2-digit', minute:'2-digit', hour12:false
+}});
+const DFMT = new Intl.DateTimeFormat('es-MX', {{
+  timeZone:'America/Mexico_City',
+  month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', hour12:false
+}});
 
 const BASE = {{
-  layout:{{background:{{type:'solid',color:'#131722'}},textColor:'#535964',fontFamily:"'Courier New',monospace",fontSize:11}},
-  grid:{{vertLines:{{color:'rgba(42,46,57,0.5)',style:1}},horzLines:{{color:'rgba(42,46,57,0.5)',style:1}}}},
-  crosshair:{{mode:1,vertLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}},horzLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}}}},
-  rightPriceScale:{{borderColor:'#2a2e39',mode:0}},
-  timeScale:{{borderColor:'#2a2e39',timeVisible:true,secondsVisible:false}},
-  handleScroll:{{mouseWheel:true,pressedMouseMove:true}},
+  layout:{{background:{{type:'solid',color:'#131722'}},textColor:'#535964',
+          fontFamily:"'Courier New',monospace",fontSize:11}},
+  grid:{{vertLines:{{color:'rgba(42,46,57,.5)',style:1}},
+        horzLines:{{color:'rgba(42,46,57,.5)',style:1}}}},
+  crosshair:{{mode:LightweightCharts.CrosshairMode.Normal,
+    vertLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}},
+    horzLine:{{color:'#758696',width:1,style:1,labelBackgroundColor:'#363a45'}}}},
+  rightPriceScale:{{borderColor:'#2a2e39'}},
+  timeScale:{{
+    borderColor:'#2a2e39', timeVisible:true, secondsVisible:false,
+    tickMarkFormatter: t => FMT.format(new Date(t*1000)),
+  }},
+  localization:{{ timeFormatter: t => DFMT.format(new Date(t*1000)) }},
+  handleScroll:{{mouseWheel:true,pressedMouseMove:true,horzTouchDrag:true}},
   handleScale:{{mouseWheel:true,pinch:true,axisPressedMouseMove:true}},
 }};
 
-const W = document.getElementById('chart').offsetWidth;
-
-// ── Price chart ────────────────────────────────────────────────────────
-const chart = LightweightCharts.createChart(document.getElementById('chart'),
-  {{...BASE, width:W, height:460}});
-
-const cs = chart.addCandlestickSeries({{
-  upColor:'#26a69a', downColor:'#ef5350',
-  borderUpColor:'#26a69a', borderDownColor:'#ef5350',
-  wickUpColor:'#26a69a', wickDownColor:'#ef5350',
+const W = document.getElementById('mc').offsetWidth || 800;
+const mc = LightweightCharts.createChart(document.getElementById('mc'),{{...BASE,width:W,height:460}});
+const cs = mc.addCandlestickSeries({{
+  upColor:'#26a69a',downColor:'#ef5350',
+  borderUpColor:'#26a69a',borderDownColor:'#ef5350',
+  wickUpColor:'#26a69a',wickDownColor:'#ef5350',
 }});
-cs.setData(CANDLES);
+cs.setData(C);
+G.forEach(l=>cs.createPriceLine(l));
 
-// GEX price lines
-GEX_LINES.forEach(l => cs.createPriceLine(l));
-
-// ── Volume chart (shared x-axis) ────────────────────────────────────────
-const volChart = LightweightCharts.createChart(document.getElementById('vol'),
-  {{...BASE,
-    width:W, height:80,
-    timeScale:{{...BASE.timeScale, visible:false}},
-    rightPriceScale:{{visible:false}},
-    leftPriceScale:{{visible:false}},
-  }});
-
-const vs = volChart.addHistogramSeries({{
-  priceFormat:{{type:'volume'}},
-  priceScaleId:'vol',
-  lastValueVisible:false, priceLineVisible:false,
+const vc = LightweightCharts.createChart(document.getElementById('vc'),{{
+  ...BASE, width:W, height:80,
+  timeScale:{{...BASE.timeScale,visible:false}},
+  rightPriceScale:{{visible:false}}, leftPriceScale:{{visible:false}},
 }});
-vs.setData(VOLUMES);
+const vs = vc.addHistogramSeries({{priceScaleId:'v',lastValueVisible:false,priceLineVisible:false}});
+vs.setData(V);
 
-// ── Sync crosshair ─────────────────────────────────────────────────────
-function sync(src, dst, param){{
-  if(!param||!param.time){{dst.clearCrossHair();return;}}
-  const x = src.timeScale().timeToCoordinate(param.time);
-  dst.setCrossHairXY(x,0,true);
+function sx(a,b,p){{
+  if(!p||!p.time){{b.clearCrossHair();return;}}
+  b.setCrossHairXY(a.timeScale().timeToCoordinate(p.time),0,true);
 }}
-chart.subscribeCrosshairMove(p=>sync(chart,volChart,p));
-volChart.subscribeCrosshairMove(p=>sync(volChart,chart,p));
+mc.subscribeCrosshairMove(p=>sx(mc,vc,p));
+vc.subscribeCrosshairMove(p=>sx(vc,mc,p));
 
-// ── OHLC tooltip ───────────────────────────────────────────────────────
-const tip = document.getElementById('ohlc');
-chart.subscribeCrosshairMove(p=>{{
+const tip=document.getElementById('tip');
+mc.subscribeCrosshairMove(p=>{{
   if(!p.time||!p.seriesData.has(cs)){{tip.style.display='none';return;}}
-  const c=p.seriesData.get(cs);
-  const chg=c.close-c.open, chgP=(chg/c.open*100).toFixed(2);
-  const clr=chg>=0?'#26a69a':'#ef5350';
+  const r=p.seriesData.get(cs), d=r.close-r.open, pct=(d/r.open*100).toFixed(2);
+  const cl=d>=0?'#26a69a':'#ef5350', t=FMT.format(new Date(p.time*1000));
   tip.style.display='block';
-  tip.innerHTML=`<span style="color:${{clr}}">O:${{c.open.toFixed(2)}} H:${{c.high.toFixed(2)}} L:${{c.low.toFixed(2)}} C:${{c.close.toFixed(2)}} <b>${{chg>=0?'+':''}}${{chg.toFixed(2)}} (${{chgP}}%)</b></span>`;
+  tip.innerHTML=`<span style="color:#787b86">${{t}}</span>&nbsp;&nbsp;`
+    +`<span style="color:${{cl}}">O:${{r.open.toFixed(2)}} H:${{r.high.toFixed(2)}} `
+    +`L:${{r.low.toFixed(2)}} C:${{r.close.toFixed(2)}}&nbsp;`
+    +`<b>${{d>=0?'+':''}}${{d.toFixed(2)}} (${{pct}}%)</b></span>`;
 }});
 
-// ── Resize ─────────────────────────────────────────────────────────────
-window.addEventListener('resize',()=>{{
+const ro=new ResizeObserver(()=>{{
   const w=document.getElementById('wrap').offsetWidth;
-  chart.applyOptions({{width:w}});
-  volChart.applyOptions({{width:w}});
+  if(w>0){{mc.applyOptions({{width:w}});vc.applyOptions({{width:w}});}}
 }});
-chart.timeScale().scrollToRealTime();
-</script>
-</body>
-</html>"""
+ro.observe(document.getElementById('wrap'));
+mc.timeScale().scrollToRealTime();
+</script></body></html>"""
 
-    components.html(html, height=570, scrolling=False)
+    components.html(html, height=578, scrolling=False)
+
 
 
 
@@ -2485,7 +2476,16 @@ def show_dashboard():
         intra_days = st.selectbox("Días", [1, 2, 3, 5], index=0,
                                   key="intra_days", label_visibility="visible")
 
-    intra_key = f"intra_{symbol}_{intra_freq}_{intra_days}"
+    # Cache key includes a 5-minute bucket → auto-expires every 5 min during market hours
+    now_cdmx_str = datetime.datetime.now(_CDMX_TZ).strftime("%Y%m%d_%H%M")[:-1]  # floor to 10-min
+    intra_key = f"intra_{symbol}_{intra_freq}_{intra_days}_{now_cdmx_str}"
+
+    # Clear stale cache for this symbol (different bucket)
+    stale = [k for k in list(st.session_state.keys())
+             if k.startswith(f"intra_{symbol}_") and k != intra_key]
+    for k in stale:
+        del st.session_state[k]
+
     if intra_key not in st.session_state:
         with st.spinner(f"Cargando velas {intra_freq}min…"):
             intra_df, intra_err = fetch_intraday(symbol, intra_freq, intra_days)
@@ -2493,6 +2493,14 @@ def show_dashboard():
         st.session_state[intra_key + "_err"]  = intra_err
     intra_df  = st.session_state.get(intra_key, pd.DataFrame())
     intra_err = st.session_state.get(intra_key + "_err", "")
+
+    # Manual refresh button
+    _, col_ref = st.columns([5, 1])
+    with col_ref:
+        if st.button("↺ Refresh", key="intra_refresh"):
+            for k in [intra_key, intra_key + "_err"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
     if not intra_df.empty:
         render_tv_chart(intra_df, spot, gex_key, mp, em_lo, em_hi,
