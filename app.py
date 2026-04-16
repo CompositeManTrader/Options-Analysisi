@@ -3,17 +3,32 @@ Options Chain Analyzer — Charles Schwab API
 Bloomberg-style dark UI · Greeks · GEX · IV Skew · Term Structure
 """
 
+import json
+import base64
+import datetime
+import time
+import warnings
+from datetime import timezone
+from urllib.parse import urlencode, urlparse, parse_qs
+
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests, base64, datetime, time, warnings, pytz
-from urllib.parse import urlencode, urlparse, parse_qs
+import requests
+import pytz
 
 warnings.filterwarnings("ignore")
 
 _CDMX_TZ = pytz.timezone("America/Mexico_City")
+_UTC     = timezone.utc
+
+
+def _utcnow():
+    """Timezone-aware UTC now (replaces deprecated datetime.utcnow())."""
+    return datetime.datetime.now(_UTC)
 
 st.set_page_config(
     page_title="Options Terminal",
@@ -90,7 +105,7 @@ button[kind="primary"]:hover {
     padding: 10px 14px !important;
 }
 [data-testid="stMetricLabel"] {
-    font-size: 0.62rem !important; color: #5050780 !important;
+    font-size: 0.62rem !important;
     text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600 !important;
     color: #606080 !important;
 }
@@ -284,24 +299,17 @@ def build_auth_url(app_key, callback_url):
     return f"{_AUTH_URL}?{urlencode({'client_id': app_key, 'redirect_uri': callback_url})}"
 
 
-def exchange_code(app_key, app_secret, code, callback_url):
-    creds = base64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
-    r = requests.post(_TOKEN_URL,
-        headers={"Authorization": f"Basic {creds}",
-                 "Content-Type": "application/x-www-form-urlencoded"},
-        data={"grant_type": "authorization_code", "code": code,
-              "redirect_uri": callback_url}, timeout=15)
-    if not r.ok:
-        raise ValueError(f"HTTP {r.status_code} — {r.text}")
-    return r.json()
-
-
 def _refresh_access_token():
     tok = st.session_state.get("tokens", {})
     if not tok:
         return
-    expiry = tok.get("expiry", datetime.datetime.min)
-    if datetime.datetime.utcnow() >= expiry - datetime.timedelta(seconds=60):
+    expiry = tok.get("expiry")
+    if expiry is None:
+        expiry = datetime.datetime.min.replace(tzinfo=_UTC)
+    elif expiry.tzinfo is None:
+        # Backwards-compat: legacy session_state may hold naive datetimes
+        expiry = expiry.replace(tzinfo=_UTC)
+    if _utcnow() >= expiry - datetime.timedelta(seconds=60):
         try:
             creds = base64.b64encode(
                 f"{st.session_state['app_key']}:{st.session_state['app_secret']}".encode()
@@ -316,7 +324,7 @@ def _refresh_access_token():
             tok.update({
                 "access_token":  new["access_token"],
                 "refresh_token": new.get("refresh_token", tok["refresh_token"]),
-                "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                "expiry": _utcnow() + datetime.timedelta(
                     seconds=new.get("expires_in", 1800)),
             })
             st.session_state["tokens"] = tok
@@ -389,7 +397,7 @@ def try_auto_connect():
         st.session_state["tokens"] = {
             "access_token":  tok["access_token"],
             "refresh_token": tok.get("refresh_token", refresh_token),
-            "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+            "expiry": _utcnow() + datetime.timedelta(
                 seconds=tok.get("expires_in", 1800)),
         }
         st.session_state["connected"] = True
@@ -560,7 +568,7 @@ def _finish_oauth(redirect_url):
         st.session_state["tokens"] = {
             "access_token":  tok["access_token"],
             "refresh_token": refresh_token,
-            "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+            "expiry": _utcnow() + datetime.timedelta(
                 seconds=tok.get("expires_in", 1800)),
         }
         st.session_state["connected"]     = True
@@ -761,13 +769,22 @@ def by_exp(df, exp):
 #  ANALYTICS
 # ═══════════════════════════════════════════════════════════════════════════════
 def calc_max_pain(c, p):
+    """
+    Strike where total OTM-writer payout (call+put OI loss) is minimized.
+    Vectorized with numpy — handles large chains efficiently.
+    """
     if c.empty or p.empty or "OI" not in c.columns:
         return None
-    strikes = sorted(set(c["Strike"].tolist() + p["Strike"].tolist()))
-    co = c.set_index("Strike")["OI"].to_dict()
-    po = p.set_index("Strike")["OI"].to_dict()
-    pain = {s: sum(max(0.,s-x)*co.get(x,0)+max(0.,x-s)*po.get(x,0) for x in strikes) for s in strikes}
-    return min(pain, key=pain.get) if pain else None
+    strikes = np.array(sorted(set(c["Strike"].tolist() + p["Strike"].tolist())), dtype=float)
+    if strikes.size == 0:
+        return None
+    co = c.set_index("Strike")["OI"].reindex(strikes, fill_value=0).to_numpy(dtype=float)
+    po = p.set_index("Strike")["OI"].reindex(strikes, fill_value=0).to_numpy(dtype=float)
+    # pain[i] = sum_j max(0, S_i - K_j) * call_OI_j + max(0, K_j - S_i) * put_OI_j
+    diff_call = np.maximum(0.0, strikes[:, None] - strikes[None, :])  # S - K
+    diff_put  = np.maximum(0.0, strikes[None, :] - strikes[:, None])  # K - S
+    pain = diff_call @ co + diff_put @ po
+    return float(strikes[int(np.argmin(pain))])
 
 
 def calc_pcr(c, p):
@@ -800,7 +817,14 @@ def calc_expected_move(spot, iv_pct, dte):
     return round(spot - move, 2), round(spot + move, 2)
 
 
-_RF_RATE = 0.045  # Risk-free rate (~Fed funds); update periodically
+def _get_rf_rate():
+    """Risk-free rate from secrets (RF_RATE) or fallback. Decimal form (0.045 = 4.5%)."""
+    try:
+        return float(st.secrets.get("RF_RATE", 0.045))
+    except Exception:
+        return 0.045
+
+_RF_RATE = 0.045  # Updated from secrets at runtime when available
 
 def _sf(x, d=0.0):
     try: return float(x)
@@ -819,16 +843,27 @@ def _phi(x):
     return np.exp(-x**2/2) / np.sqrt(2*np.pi)
 
 def bs_vanna(S, K, T, sigma, r=_RF_RATE):
-    """Vanna = dDelta/dVol = -exp(-d1²/2)/(√2π) × d2/sigma"""
+    """
+    Vanna = ∂Δ/∂σ = -φ(d1) × d2 / σ
+    By put–call parity Vanna_put = Vanna_call (NO sign flip for puts).
+    """
     d1, d2 = _bs_d1d2(S, K, T, sigma, r)
-    if d1 is None: return 0.0
+    if d1 is None or sigma <= 0:
+        return 0.0
     return -_phi(d1) * d2 / sigma
 
 def bs_charm(S, K, T, sigma, r=_RF_RATE):
-    """Charm = dDelta/dt — delta decay per day"""
+    """
+    Charm = ∂Δ/∂t — change in delta per unit calendar time.
+    For a non-dividend call: Charm = -φ(d1) × [2rT - d2·σ√T] / (2T·σ√T)
+    Returned per-day by dividing by 365 to keep units consistent with other Greeks.
+    By put–call parity Δ_put = Δ_call − 1, therefore Charm_put = Charm_call.
+    """
     d1, d2 = _bs_d1d2(S, K, T, sigma, r)
-    if d1 is None or T <= 0: return 0.0
-    return _phi(d1) * (2*r*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
+    if d1 is None or T <= 0 or sigma <= 0:
+        return 0.0
+    charm_per_year = -_phi(d1) * (2*r*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
+    return charm_per_year / 365.0
 
 
 def calc_gex_advanced(c_all, p_all, spot):
@@ -917,23 +952,29 @@ def calc_gex_by_expiry(c_all, p_all, spot):
 
 
 def calc_second_order_greeks(calls: pd.DataFrame, puts: pd.DataFrame,
-                             spot: float, r: float = _RF_RATE):
-    """Add Vanna and Charm columns using Black-Scholes. Returns new DataFrames."""
+                             spot: float, r: float = None):
+    """
+    Add Vanna and Charm columns using Black-Scholes.
+    By put–call parity, Vanna and Charm are IDENTICAL for calls and puts
+    (since Δ_put = Δ_call − 1, the partials w.r.t. σ and t are equal).
+    Returns new DataFrames.
+    """
+    if r is None:
+        r = _get_rf_rate()
     result = []
-    for df, opt_t in [(calls, "call"), (puts, "put")]:
+    for df, _opt_t in [(calls, "call"), (puts, "put")]:
         if df.empty or not all(c in df.columns for c in ["Strike", "IV%", "DTE"]):
             result.append(df)
             continue
         df_out = df.copy()
         vannas, charms = [], []
         for _, row in df_out.iterrows():
-            K    = _sf(row.get("Strike", 0))
-            iv   = _sf(row.get("IV%", 0)) / 100.0
+            K     = _sf(row.get("Strike", 0))
+            iv    = _sf(row.get("IV%", 0)) / 100.0
             dte_r = _sf(row.get("DTE", 0))
-            T    = max(float(np.asarray(dte_r).flat[0]) / 365.0, 1e-6)
-            sign = -1 if opt_t == "put" else 1
-            vannas.append(round(sign * bs_vanna(spot, K, T, iv, r), 6))
-            charms.append(round(sign * bs_charm(spot, K, T, iv, r), 6))
+            T     = max(dte_r / 365.0, 1e-6)
+            vannas.append(round(bs_vanna(spot, K, T, iv, r), 6))
+            charms.append(round(bs_charm(spot, K, T, iv, r), 6))
         df_out["Vanna"] = vannas
         df_out["Charm"] = charms
         result.append(df_out)
@@ -993,35 +1034,48 @@ def calc_iv_skew(c, p, spot):
     return skew.sort_values("Strike").reset_index(drop=True)
 
 
-def calc_term_structure(c_all, spot):
-    """ATM IV per expiration. Robust to type issues."""
+def calc_term_structure(c_all, spot, p_all=None):
+    """
+    ATM IV per expiration. When both call and put data are available, returns
+    the average of nearest-strike call IV and put IV (more robust ATM proxy).
+    Falls back to call-only if puts unavailable.
+    """
     if c_all.empty or "IV%" not in c_all.columns or "Expiry" not in c_all.columns:
         return pd.DataFrame()
+
     rows = []
+    p_groups = {exp: g for exp, g in p_all.groupby("Expiry")} \
+        if p_all is not None and not p_all.empty and "Expiry" in p_all.columns else {}
+
     for exp, grp in c_all.groupby("Expiry"):
         grp = grp.copy()
         grp["IV%"]    = pd.to_numeric(grp["IV%"],    errors="coerce")
         grp["Strike"] = pd.to_numeric(grp["Strike"], errors="coerce")
         grp["DTE"]    = pd.to_numeric(grp.get("DTE", 0), errors="coerce").fillna(0)
         grp = grp.dropna(subset=["IV%", "Strike"])
+        grp = grp[grp["IV%"] > 0.01]
         if grp.empty:
             continue
         dte_val = int(grp["DTE"].iloc[0])
-        idx     = (grp["Strike"] - spot).abs().idxmin()
-        atm_iv  = float(grp.loc[idx, "IV%"])
+        idx_c   = (grp["Strike"] - spot).abs().idxmin()
+        atm_c   = float(grp.loc[idx_c, "IV%"])
+
+        # Try to add put IV at the same nearest strike
+        atm_p = None
+        if exp in p_groups:
+            pg = p_groups[exp].copy()
+            pg["IV%"]    = pd.to_numeric(pg["IV%"],    errors="coerce")
+            pg["Strike"] = pd.to_numeric(pg["Strike"], errors="coerce")
+            pg = pg.dropna(subset=["IV%", "Strike"])
+            pg = pg[pg["IV%"] > 0.01]
+            if not pg.empty:
+                idx_p = (pg["Strike"] - spot).abs().idxmin()
+                atm_p = float(pg.loc[idx_p, "IV%"])
+
+        atm_iv = (atm_c + atm_p) / 2.0 if atm_p is not None else atm_c
         if atm_iv > 0:
             rows.append({"Expiry": exp, "DTE": dte_val, "ATM_IV": round(atm_iv, 2)})
     return pd.DataFrame(rows).sort_values("DTE").reset_index(drop=True)
-
-
-def calc_charm(c, p, dte):
-    """Approximate charm (delta decay): Theta/Spot × DTE proxy."""
-    if c.empty or "Delta" not in c.columns or "Theta" not in c.columns:
-        return c, p
-    for df in [c, p]:
-        if "Theta" in df.columns and "Delta" in df.columns and dte > 0:
-            df["Charm"] = (-df["Theta"] / (365 * abs(df["Delta"]) + 1e-9) ).round(4)
-    return c, p
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1967,8 +2021,6 @@ def render_tv_chart(price_df: pd.DataFrame, spot: float, gex_key: dict,
     Passes raw UTC unix seconds. JS Intl.DateTimeFormat converts to CDMX display.
     Works correctly on Streamlit Cloud (server timezone = UTC).
     """
-    import json
-    
     if price_df.empty:
         st.caption("Sin datos de precio para mostrar la gráfica.")
         return
@@ -2101,9 +2153,20 @@ const vc=LightweightCharts.createChart(document.getElementById("vc"),{{...CFG,wi
 const vs=vc.addHistogramSeries({{priceScaleId:"v",lastValueVisible:false,priceLineVisible:false}});
 vs.setData(V);
 
-function sync(a,b,p){{if(!p||!p.time){{b.clearCrossHair();return;}}b.setCrossHairXY(a.timeScale().timeToCoordinate(p.time),0,true);}}
-mc.subscribeCrosshairMove(p=>sync(mc,vc,p));
-vc.subscribeCrosshairMove(p=>sync(vc,mc,p));
+// Time-scale sync (the only sync API actually exposed in lightweight-charts v4).
+// Crosshair-position sync between separate chart instances is NOT available
+// in v4 public API — would require a single chart with multiple panes.
+let _syncing=false;
+function syncRange(src,dst){{
+  if(_syncing) return;
+  const r=src.timeScale().getVisibleLogicalRange();
+  if(!r) return;
+  _syncing=true;
+  dst.timeScale().setVisibleLogicalRange(r);
+  _syncing=false;
+}}
+mc.timeScale().subscribeVisibleLogicalRangeChange(()=>syncRange(mc,vc));
+vc.timeScale().subscribeVisibleLogicalRangeChange(()=>syncRange(vc,mc));
 
 const tip=document.getElementById("tip");
 mc.subscribeCrosshairMove(p=>{{
@@ -2118,42 +2181,7 @@ new ResizeObserver(()=>{{const w=document.getElementById("w").offsetWidth;if(w>1
 mc.timeScale().scrollToRealTime();
 </script></body></html>"""
 
-    st.iframe(html, height=548)
-
-
-def chart_iv_skew(skew_df, spot):
-    if skew_df.empty:
-        return None
-    fig = make_subplots(rows=1, cols=2,
-        subplot_titles=["IV POR STRIKE  (Calls vs Puts)", "SKEW  (Put IV − Call IV)"],
-        horizontal_spacing=0.10)
-    fig.add_trace(go.Scatter(
-        x=skew_df["Strike"], y=skew_df["C_IV"], name="Call IV",
-        line=dict(color=_GREEN, width=2), mode="lines",
-        hovertemplate="Strike: %{x}<br>Call IV: %{y:.1f}%<extra></extra>",
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=skew_df["Strike"], y=skew_df["P_IV"], name="Put IV",
-        line=dict(color=_RED, width=2), mode="lines",
-        hovertemplate="Strike: %{x}<br>Put IV: %{y:.1f}%<extra></extra>",
-    ), row=1, col=1)
-    _vline(fig, spot, row=1, col=1)
-    skew_colors = [_RED if v > 0 else _GREEN for v in skew_df["Skew"]]
-    fig.add_trace(go.Bar(
-        x=skew_df["Strike"], y=skew_df["Skew"],
-        marker_color=skew_colors, marker_line_width=0,
-        name="Skew", showlegend=False,
-        hovertemplate="Strike: %{x}<br>Skew: %{y:.1f}%<extra></extra>",
-    ), row=1, col=2)
-    fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.08)", row=1, col=2)
-    _vline(fig, spot, row=1, col=2)
-    fig.update_layout(height=320, **_BASE)
-    fig.update_xaxes(**_AX_NOZERO, title_text="Strike")
-    fig.update_yaxes(**_AX_NOZERO, title_text="IV (%)", row=1, col=1)
-    fig.update_yaxes(**_AX_ZERO, title_text="Put IV − Call IV (%)", row=1, col=2)
-    for ann in fig.layout.annotations:
-        ann.font.update(size=10, color="#606080", family=_FONT_MONO)
-    return fig
+    components.html(html, height=548, scrolling=False)
 
 
 def chart_term_structure(ts_df):
@@ -2275,8 +2303,14 @@ def show_dashboard():
 
     with b6:
         if st.button("EXIT", use_container_width=True):
-            for k in ["tokens","connected","chain_data","last_sym","symbol",
-                      "app_key","app_secret","callback_url","oauth_pending","all_exps"]:
+            for k in ["tokens","connected","chain_data","last_sym","last_strikes",
+                      "symbol","app_key","app_secret","callback_url",
+                      "oauth_pending","oauth_code","all_exps","sel_exp",
+                      "_last_refresh_count"]:
+                st.session_state.pop(k, None)
+            # also drop any cached intraday/price keys
+            for k in [k for k in list(st.session_state.keys())
+                      if k.startswith("intra_") or k.startswith("ph_")]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -2361,7 +2395,7 @@ def show_dashboard():
     _, gex_key   = calc_gex_advanced(calls_all, puts_all, spot)
     total_gex    = gex_key.get("total_gex_bn")
     skew_df      = calc_iv_skew(calls_all, puts_all, spot)
-    ts_df        = calc_term_structure(calls_all, spot)
+    ts_df        = calc_term_structure(calls_all, spot, puts_all)
     dex_data     = calc_dex_advanced(calls_all, puts_all, spot)
     last_refresh = st.session_state.get("last_refresh", datetime.datetime.now())
 
@@ -2413,7 +2447,7 @@ def show_dashboard():
     m5.metric("ATM IV",    f"{iv_atm:.1f}%" if iv_atm else "—")
     m6.metric("P/C RATIO", f"{p_c:.2f}"    if p_c    else "—")
     m7.metric("MAX PAIN",  f"${mp:.0f}"    if mp     else "—")
-    m8.metric("NET GEX",   f"{'${:.2f}B'.format(total_gex)}" if total_gex is not None else "—",
+    m8.metric("NET GEX", f"${total_gex:+.2f}B" if total_gex is not None else "—",
               "LONG Γ" if (total_gex or 0) >= 0 else "SHORT Γ")
 
     # Expected move info
@@ -2454,23 +2488,27 @@ def show_dashboard():
         intra_days = st.selectbox("Días", [1, 2, 3, 5], index=0,
                                   key="intra_days", label_visibility="visible")
 
-    # Cache key includes a 5-minute bucket → auto-expires every 5 min during market hours
-    now_cdmx_str = datetime.datetime.now(_CDMX_TZ).strftime("%Y%m%d_%H%M")[:-1]  # floor to 10-min
+    # Cache key floored to a 5-minute bucket → auto-expires every 5 min during market hours
+    _now_cdmx = datetime.datetime.now(_CDMX_TZ)
+    _bucket_min = (_now_cdmx.minute // 5) * 5
+    now_cdmx_str = _now_cdmx.strftime("%Y%m%d_%H") + f"{_bucket_min:02d}"
     intra_key = f"intra_{symbol}_{intra_freq}_{intra_days}_{now_cdmx_str}"
+    intra_err_key = intra_key + "_err"
 
-    # Clear stale cache for this symbol (different bucket)
+    # Clear stale cache for this symbol — keep both data + err for the active bucket
     stale = [k for k in list(st.session_state.keys())
-             if k.startswith(f"intra_{symbol}_") and k != intra_key]
+             if k.startswith(f"intra_{symbol}_")
+             and k not in (intra_key, intra_err_key)]
     for k in stale:
         del st.session_state[k]
 
     if intra_key not in st.session_state:
         with st.spinner(f"Cargando velas {intra_freq}min…"):
             intra_df, intra_err = fetch_intraday(symbol, intra_freq, intra_days)
-        st.session_state[intra_key]           = intra_df
-        st.session_state[intra_key + "_err"]  = intra_err
+        st.session_state[intra_key]      = intra_df
+        st.session_state[intra_err_key]  = intra_err
     intra_df  = st.session_state.get(intra_key, pd.DataFrame())
-    intra_err = st.session_state.get(intra_key + "_err", "")
+    intra_err = st.session_state.get(intra_err_key, "")
 
     # Manual refresh button
     _, col_ref = st.columns([5, 1])
@@ -2581,17 +2619,31 @@ def show_dashboard():
         unsafe_allow_html=True,
     )
 
-    # ── Auto-refresh ──────────────────────────────────────────────────────────
+    # ── Auto-refresh (non-blocking) ───────────────────────────────────────────
     if auto_refresh:
-        elapsed = (datetime.datetime.now() - last_refresh).seconds
-        remaining = max(0, 30 - elapsed)
-        if remaining == 0:
-            st.session_state.pop("chain_data", None)
-            st.rerun()
-        else:
-            st.caption(f"🔄 Actualizando en {remaining}s…")
-            time.sleep(1)
-            st.rerun()
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            count = st_autorefresh(interval=30_000, key="chain_autorefresh")
+            # On every tick, invalidate chain_data so the next render fetches fresh
+            if count and count != st.session_state.get("_last_refresh_count"):
+                st.session_state["_last_refresh_count"] = count
+                st.session_state.pop("chain_data", None)
+                st.rerun()
+            st.caption("🔄 Auto-refresh activo cada 30s (no bloqueante).")
+        except ImportError:
+            # Fallback: less efficient but works without the optional dep
+            elapsed = (datetime.datetime.now() - last_refresh).seconds
+            remaining = max(0, 30 - elapsed)
+            if remaining == 0:
+                st.session_state.pop("chain_data", None)
+                st.rerun()
+            else:
+                st.caption(
+                    f"🔄 Actualizando en {remaining}s… "
+                    "(instala `streamlit-autorefresh` para refresco no bloqueante)."
+                )
+                time.sleep(1)
+                st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2642,7 +2694,7 @@ def main():
                     "tokens": {
                         "access_token":  tok["access_token"],
                         "refresh_token": tok["refresh_token"],
-                        "expiry": datetime.datetime.utcnow() + datetime.timedelta(
+                        "expiry": _utcnow() + datetime.timedelta(
                             seconds=tok.get("expires_in", 1800)),
                     },
                 })
